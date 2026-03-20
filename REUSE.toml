@@ -4,6 +4,12 @@ SPDX-PackageSupplier = "Jonas Hörsch <jonas.hoersch@posteo.de>"
 SPDX-PackageDownloadLocation = "https://github.com/PyPSA/atlite"
 
 [[annotations]]
+path = "test-cache/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Contributors to atlite <https://github.com/pypsa/atlite>"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
 path = "doc/img/**"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "Contributors to atlite <https://github.com/pypsa/atlite>"
