@@ -37,8 +37,11 @@ Technical notes
 
 import calendar
 import logging
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from tenacity import before_sleep_log, retry, stop_after_attempt, wait_random_exponential
 
 import numpy as np
 import pandas as pd
@@ -49,7 +52,7 @@ from atlite.pv.solar_position import SolarPosition
 
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 8  # concurrent OPeNDAP requests
+MAX_WORKERS = 16  # concurrent OPeNDAP requests
 
 # ---------------------------------------------------------------------------
 # Module-level constants required by atlite
@@ -261,10 +264,17 @@ def _bbox(coords):
     )
 
 
+@retry(
+    wait=wait_random_exponential(multiplier=1, min=2, max=60),
+    stop=stop_after_attempt(5),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
 def _retrieve_var(short_name, year, month, x0, y0, x1, y1):
     """Fetch one variable for one month at native 0.25° resolution.
 
     Returns a (time, y, x) DataArray, or (y, x) for the invariant height var.
+    Retried up to 5 times with random exponential backoff (2–60 s) on any
+    error, so transient THREDDS 500s and timeouts are handled automatically.
     """
     product_dir, param_code, ncar_var = VAR_MAP[short_name]
 
@@ -324,17 +334,29 @@ def _fetch_vars(short_names, coords):
             for year, month in months:
                 tasks.append((sn, year, month))
 
+    n_total = len(tasks)
+    logger.info(
+        "era5-ncar: submitting %d tasks for [%s] with %d workers",
+        n_total, ", ".join(short_names), MAX_WORKERS,
+    )
+    t_start = time.time()
+
     raw = {}  # (short_name, year, month) → DataArray
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
             pool.submit(_retrieve_var, sn, yr, mo, x0, y0, x1, y1): (sn, yr, mo)
             for sn, yr, mo in tasks
         }
-        for future in as_completed(futures):
-            key = futures[future]
-            sn, yr, mo = key
-            logger.debug("era5-ncar: received %s %s-%s", sn, yr, mo)
-            raw[key] = future.result()
+        for n_done, future in enumerate(as_completed(futures), 1):
+            sn, yr, mo = futures[future]
+            elapsed = time.time() - t_start
+            rate = elapsed / n_done
+            eta = rate * (n_total - n_done)
+            logger.info(
+                "era5-ncar: [%d/%d] %-6s %s-%02d  (%.0fs elapsed, ETA %.0fs)",
+                n_done, n_total, sn, yr if yr else "—", mo or 0, elapsed, eta,
+            )
+            raw[(sn, yr, mo)] = future.result()
 
     # Assemble per-variable: select target times, concatenate months, interpolate.
     assembled = {}

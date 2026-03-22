@@ -51,6 +51,7 @@ dependencies = [
     "h5netcdf>=1.6.1",
     "h5py>=3.16.0",
     "pydap>=3.5.9",
+    "tenacity",
 ]
 
 [project.urls]
