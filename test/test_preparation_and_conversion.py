@@ -587,6 +587,99 @@ class TestERA5:
         return line_rating_test(cutout_era5)
 
 
+class TestERA5NCAR:
+    """Run conversion tests against ERA5-NCAR (THREDDS/OPeNDAP) data.
+
+    Mirrors TestERA5 so that any regression in the NCAR module is caught by
+    the same test helpers.  Also verifies that the NCAR output is numerically
+    close to the CDS reference cutout.
+    """
+
+    @staticmethod
+    def test_all_non_na(cutout_era5_ncar):
+        assert np.isfinite(cutout_era5_ncar.data).all()
+
+    @staticmethod
+    def test_all_non_na_coarse(cutout_era5_ncar_coarse):
+        assert np.isfinite(cutout_era5_ncar_coarse.data).all()
+
+    @staticmethod
+    def test_dx_dy_preservation(cutout_era5_ncar):
+        assert np.allclose(np.diff(cutout_era5_ncar.data.x), 0.25)
+        assert np.allclose(np.diff(cutout_era5_ncar.data.y), 0.25)
+
+    @staticmethod
+    def test_dx_dy_preservation_coarse(cutout_era5_ncar_coarse):
+        assert np.allclose(
+            np.diff(cutout_era5_ncar_coarse.data.x),
+            cutout_era5_ncar_coarse.data.attrs["dx"],
+        )
+        assert np.allclose(
+            np.diff(cutout_era5_ncar_coarse.data.y),
+            cutout_era5_ncar_coarse.data.attrs["dy"],
+        )
+
+    @staticmethod
+    def test_prepared_features(cutout_era5_ncar):
+        return prepared_features_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_pv(cutout_era5_ncar):
+        return pv_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_pv_tracking(cutout_era5_ncar):
+        return pv_tracking_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_wind(cutout_era5_ncar):
+        return wind_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_runoff(cutout_era5_ncar):
+        return runoff_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_hydro(cutout_era5_ncar):
+        return hydro_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_solar_thermal(cutout_era5_ncar):
+        return solar_thermal_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_heat_demand(cutout_era5_ncar):
+        return heat_demand_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_soil_temperature(cutout_era5_ncar):
+        return soil_temperature_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_dewpoint_temperature(cutout_era5_ncar):
+        return dewpoint_temperature_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_line_rating(cutout_era5_ncar):
+        return line_rating_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_compare_with_era5(cutout_era5, cutout_era5_ncar):
+        """NCAR module output must match CDS reference within float32 tolerance."""
+        from xarray.testing import assert_allclose
+
+        skip_vars = {"solar_altitude", "solar_azimuth"}  # purely geometric, identical
+        for var in cutout_era5.data.data_vars:
+            if var in skip_vars:
+                continue
+            assert_allclose(
+                cutout_era5.data[var],
+                cutout_era5_ncar.data[var],
+                rtol=1e-4,
+                atol=1e-4,
+            )
+
+
 @pytest.mark.skipif(
     not os.path.exists(SARAH_DIR), reason="'sarah_dir' is not a valid path"
 )

@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+import requests
 from dateutil.relativedelta import relativedelta
 
 from atlite import Cutout
@@ -17,6 +18,20 @@ SARAH_DIR = os.getenv("SARAH_DIR", "/home/vres/climate-data/sarah_v2")
 GEBCO_PATH = os.getenv("GEBCO_PATH", "/home/vres/climate-data/GEBCO_2014_2D.nc")
 
 CDS_API_CONFIGURED = bool(os.environ.get("CDSAPI_URL"))
+
+
+def _check_thredds():
+    """Return True if the NCAR THREDDS server is reachable."""
+    try:
+        r = requests.head(
+            "https://thredds.rda.ucar.edu/thredds/catalog.html", timeout=10
+        )
+        return r.status_code < 500
+    except Exception:
+        return False
+
+
+THREDDS_AVAILABLE = _check_thredds()
 
 
 def pytest_addoption(parser):
@@ -182,6 +197,26 @@ def cutout_sarah_weird_resolution(cutouts_path):
     )
     cutout.prepare()
     return cutout
+
+
+def _prepare_era5_ncar_cutout(path, prepare_kwargs=None, **kwargs):
+    cutout = Cutout(path=path, module="era5-ncar", bounds=BOUNDS, **kwargs)
+    if not path.exists() and not THREDDS_AVAILABLE:
+        pytest.skip("NCAR THREDDS not reachable and no cached cutout available")
+    cutout.prepare(**(prepare_kwargs or {}))
+    return cutout
+
+
+@pytest.fixture(scope="session")
+def cutout_era5_ncar(cutouts_path):
+    tmp_path = cutouts_path / "cutout_era5_ncar.nc"
+    return _prepare_era5_ncar_cutout(tmp_path, time=TIME)
+
+
+@pytest.fixture(scope="session")
+def cutout_era5_ncar_coarse(cutouts_path):
+    tmp_path = cutouts_path / "cutout_era5_ncar_coarse.nc"
+    return _prepare_era5_ncar_cutout(tmp_path, time=TIME, dx=0.5, dy=0.7)
 
 
 @pytest.fixture(scope="session")
