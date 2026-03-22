@@ -38,6 +38,7 @@ Technical notes
 import calendar
 import logging
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -47,6 +48,8 @@ from atlite.datasets.era5 import sanitize_influx, sanitize_runoff, sanitize_wind
 from atlite.pv.solar_position import SolarPosition
 
 logger = logging.getLogger(__name__)
+
+MAX_WORKERS = 8  # concurrent OPeNDAP requests
 
 # ---------------------------------------------------------------------------
 # Module-level constants required by atlite
@@ -98,6 +101,18 @@ _INVARIANT_PATH = (
     "e5.oper.invariant/197901/"
     "e5.oper.invariant.128_129_z.ll025sc.1979010100_1979010100.nc"
 )
+
+# Raw ERA5 short names required for each feature.
+_FEATURE_VARS = {
+    "wind":        ["u10", "v10", "u100", "v100", "fsr"],
+    "influx":      ["ssrd", "ssr", "fdir", "tisr"],
+    "temperature": ["t2m", "stl4", "d2m"],
+    "runoff":      ["ro"],
+    "height":      ["z"],
+}
+
+# Forecast radiation vars stored as J/m² — convert to W/m².
+_FC_DIVIDE_BY_3600 = {"ssrd", "ssr", "fdir", "tisr"}
 
 # Extra degrees added to each side of the bbox when fetching native-resolution
 # data, so bilinear interpolation has support even at the target grid edges.
@@ -228,61 +243,7 @@ def _fc_to_hourly(subset, ncar_varname):
 
 
 # ---------------------------------------------------------------------------
-# Per-month retrieval
-# ---------------------------------------------------------------------------
-
-def _retrieve_analysis(short_name, year, month, x0, y0, x1, y1):
-    """Return (time, y, x) DataArray at native 0.25° for one an.sfc month."""
-    product_dir, param_code, ncar_var = VAR_MAP[short_name]
-    path = _an_sfc_url(product_dir, param_code, year, month)
-    ds = _open_opendap(path)
-    subset = _sel_bbox(ds, x0, y0, x1, y1)
-    da = _to_xy(subset[ncar_var].load())
-    ds.close()
-    return da
-
-
-def _retrieve_forecast_month(short_name, year, month, x0, y0, x1, y1,
-                              divide_by_3600=False):
-    """Return (time, y, x) DataArray for one fc.sfc.accumu variable and month.
-
-    Fetches the previous month's second-half file as well, which supplies
-    hours 00:00–06:00 of the first day of the month.
-    """
-    product_dir, param_code, ncar_var = VAR_MAP[short_name]
-    urls = [
-        _fc_prev_half_url(product_dir, param_code, year, month),
-        *_fc_half_urls(product_dir, param_code, year, month),
-    ]
-
-    parts = []
-    for url in urls:
-        ds = _open_opendap(url)
-        subset = _sel_bbox(ds, x0, y0, x1, y1)
-        parts.append(_fc_to_hourly(subset, ncar_var))
-        ds.close()
-
-    hourly = xr.concat(parts, dim="time").sortby("time")
-    _, idx = np.unique(hourly.time.values, return_index=True)
-    hourly = hourly.isel(time=idx)
-
-    if divide_by_3600:
-        hourly = hourly / 3600.0
-
-    return _to_xy(hourly)
-
-
-def _retrieve_height(x0, y0, x1, y1):
-    """Return (y, x) geopotential height [m]."""
-    ds = _open_opendap(_INVARIANT_PATH)
-    subset = _sel_bbox(ds, x0, y0, x1, y1)
-    z = subset["Z"].isel(time=0, drop=True).load()
-    ds.close()
-    return _to_xy(z / 9.80665)
-
-
-# ---------------------------------------------------------------------------
-# Multi-month collection + interpolation helpers
+# Concurrent fetch helpers
 # ---------------------------------------------------------------------------
 
 def _months(coords):
@@ -300,30 +261,97 @@ def _bbox(coords):
     )
 
 
-def _collect_analysis(short_name, coords, x0, y0, x1, y1):
-    t = pd.DatetimeIndex(coords["time"].values)
+def _retrieve_var(short_name, year, month, x0, y0, x1, y1):
+    """Fetch one variable for one month at native 0.25° resolution.
+
+    Returns a (time, y, x) DataArray, or (y, x) for the invariant height var.
+    """
+    product_dir, param_code, ncar_var = VAR_MAP[short_name]
+
+    if product_dir == "e5.oper.invariant":
+        ds = _open_opendap(_INVARIANT_PATH)
+        subset = _sel_bbox(ds, x0, y0, x1, y1)
+        z = subset["Z"].isel(time=0, drop=True).load()
+        ds.close()
+        return _to_xy(z / 9.80665)
+
+    if product_dir == "e5.oper.an.sfc":
+        path = _an_sfc_url(product_dir, param_code, year, month)
+        ds = _open_opendap(path)
+        subset = _sel_bbox(ds, x0, y0, x1, y1)
+        da = _to_xy(subset[ncar_var].load())
+        ds.close()
+        return da
+
+    # fc.sfc.accumu — fetch prev half + both halves of the month
+    urls = [
+        _fc_prev_half_url(product_dir, param_code, year, month),
+        *_fc_half_urls(product_dir, param_code, year, month),
+    ]
     parts = []
-    for year, month in _months(coords):
-        da = _retrieve_analysis(short_name, year, month, x0, y0, x1, y1)
-        mt = t[(t.year == year) & (t.month == month)]
-        if len(mt):
-            sel = da.sel(time=mt, method="nearest").assign_coords(time=mt.values)
-            parts.append(sel)
-    return xr.concat(parts, dim="time")
+    for url in urls:
+        ds = _open_opendap(url)
+        subset = _sel_bbox(ds, x0, y0, x1, y1)
+        parts.append(_fc_to_hourly(subset, ncar_var))
+        ds.close()
+    hourly = xr.concat(parts, dim="time").sortby("time")
+    _, idx = np.unique(hourly.time.values, return_index=True)
+    hourly = hourly.isel(time=idx)
+    if short_name in _FC_DIVIDE_BY_3600:
+        hourly = hourly / 3600.0
+    return _to_xy(hourly)
 
 
-def _collect_forecast(short_name, coords, x0, y0, x1, y1, divide_by_3600=False):
+def _fetch_vars(short_names, coords):
+    """Fetch all requested variables concurrently.
+
+    Submits one task per (short_name, year, month) combination to a thread
+    pool, concatenates monthly results, and interpolates to the cutout grid.
+
+    Returns a dict mapping short_name → DataArray on the cutout's (time, y, x)
+    grid (or (y, x) for the invariant height variable).
+    """
+    x0, y0, x1, y1 = _bbox(coords)
+    months = _months(coords)
     t = pd.DatetimeIndex(coords["time"].values)
-    parts = []
-    for year, month in _months(coords):
-        da = _retrieve_forecast_month(
-            short_name, year, month, x0, y0, x1, y1, divide_by_3600
-        )
-        mt = t[(t.year == year) & (t.month == month)]
-        if len(mt):
-            sel = da.sel(time=mt, method="nearest").assign_coords(time=mt.values)
-            parts.append(sel)
-    return xr.concat(parts, dim="time")
+
+    # Build task list; invariant vars need only one fetch (no month loop).
+    tasks = []
+    for sn in short_names:
+        if VAR_MAP[sn][0] == "e5.oper.invariant":
+            tasks.append((sn, None, None))
+        else:
+            for year, month in months:
+                tasks.append((sn, year, month))
+
+    raw = {}  # (short_name, year, month) → DataArray
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(_retrieve_var, sn, yr, mo, x0, y0, x1, y1): (sn, yr, mo)
+            for sn, yr, mo in tasks
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            sn, yr, mo = key
+            logger.debug("era5-ncar: received %s %s-%s", sn, yr, mo)
+            raw[key] = future.result()
+
+    # Assemble per-variable: select target times, concatenate months, interpolate.
+    assembled = {}
+    for sn in short_names:
+        if VAR_MAP[sn][0] == "e5.oper.invariant":
+            assembled[sn] = _interp(raw[(sn, None, None)], coords)
+        else:
+            parts = []
+            for year, month in months:
+                da = raw[(sn, year, month)]
+                mt = t[(t.year == year) & (t.month == month)]
+                if len(mt):
+                    sel = da.sel(time=mt, method="nearest").assign_coords(time=mt.values)
+                    parts.append(sel)
+            assembled[sn] = _interp(xr.concat(parts, dim="time"), coords)
+
+    return assembled
 
 
 def _interp(da, coords):
@@ -336,99 +364,72 @@ def _interp(da, coords):
 
 
 # ---------------------------------------------------------------------------
-# Feature functions
+# Feature assemblers  (receive pre-fetched vars dict, compute derived fields)
 # ---------------------------------------------------------------------------
 
 def get_data_wind(coords):
-    x0, y0, x1, y1 = _bbox(coords)
-
-    u10  = _interp(_collect_analysis("u10",  coords, x0, y0, x1, y1), coords)
-    v10  = _interp(_collect_analysis("v10",  coords, x0, y0, x1, y1), coords)
-    u100 = _interp(_collect_analysis("u100", coords, x0, y0, x1, y1), coords)
-    v100 = _interp(_collect_analysis("v100", coords, x0, y0, x1, y1), coords)
-    fsr  = _interp(_collect_analysis("fsr",  coords, x0, y0, x1, y1), coords)
-
-    wnd10m  = np.sqrt(u10**2  + v10**2)
-    wnd100m = np.sqrt(u100**2 + v100**2)
+    v = _fetch_vars(_FEATURE_VARS["wind"], coords)
+    wnd10m  = np.sqrt(v["u10"]**2  + v["v10"]**2)
+    wnd100m = np.sqrt(v["u100"]**2 + v["v100"]**2)
     wnd_shear_exp = (
         np.log(wnd10m / wnd100m) / np.log(10.0 / 100.0)
     ).assign_attrs(units="", long_name="wind shear exponent")
-
-    az = np.arctan2(u100.values, v100.values)
+    az = np.arctan2(v["u100"].values, v["v100"].values)
     wnd_azimuth = xr.DataArray(
         np.where(az >= 0, az, az + 2 * np.pi),
         dims=wnd100m.dims,
         coords=wnd100m.coords,
     )
-
     return xr.Dataset(
         {
             "wnd100m":       wnd100m.rename("wnd100m"),
             "wnd_shear_exp": wnd_shear_exp.rename("wnd_shear_exp"),
             "wnd_azimuth":   wnd_azimuth.rename("wnd_azimuth"),
-            "roughness":     fsr.rename("roughness"),
+            "roughness":     v["fsr"].rename("roughness"),
         }
     )
 
 
 def get_data_influx(coords):
-    x0, y0, x1, y1 = _bbox(coords)
-
-    ssrd = _interp(_collect_forecast("ssrd", coords, x0, y0, x1, y1, True), coords)
-    ssr  = _interp(_collect_forecast("ssr",  coords, x0, y0, x1, y1, True), coords)
-    fdir = _interp(_collect_forecast("fdir", coords, x0, y0, x1, y1, True), coords)
-    tisr = _interp(_collect_forecast("tisr", coords, x0, y0, x1, y1, True), coords)
-
-    albedo        = ((ssrd - ssr) / ssrd.where(ssrd != 0)).fillna(0.0)
-    influx_direct  = fdir
+    v = _fetch_vars(_FEATURE_VARS["influx"], coords)
+    ssrd, ssr, fdir, tisr = v["ssrd"], v["ssr"], v["fdir"], v["tisr"]
+    albedo         = ((ssrd - ssr) / ssrd.where(ssrd != 0)).fillna(0.0)
     influx_diffuse = ssrd - fdir
-    influx_toa     = tisr
-
     ds = xr.Dataset(
         {
-            "influx_direct":  influx_direct.rename("influx_direct"),
+            "influx_direct":  fdir.rename("influx_direct"),
             "influx_diffuse": influx_diffuse.rename("influx_diffuse"),
-            "influx_toa":     influx_toa.rename("influx_toa"),
+            "influx_toa":     tisr.rename("influx_toa"),
             "albedo":         albedo.rename("albedo"),
         }
     )
-    # SolarPosition requires lon/lat coordinates on the dataset.
-    # ERA5 convention: value at T = mean irradiance for T-1h..T → shift by -30 min.
     ds = ds.assign_coords(lon=ds.coords["x"], lat=ds.coords["y"])
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         sp = SolarPosition(ds, time_shift=pd.to_timedelta("-30 minutes"))
-    sp = sp.rename({v: f"solar_{v}" for v in sp.data_vars})
+    sp = sp.rename({name: f"solar_{name}" for name in sp.data_vars})
     return xr.merge([ds, sp])
 
 
 def get_data_temperature(coords):
-    x0, y0, x1, y1 = _bbox(coords)
-    t2m  = _interp(_collect_analysis("t2m",  coords, x0, y0, x1, y1), coords)
-    stl4 = _interp(_collect_analysis("stl4", coords, x0, y0, x1, y1), coords)
-    d2m  = _interp(_collect_analysis("d2m",  coords, x0, y0, x1, y1), coords)
+    v = _fetch_vars(_FEATURE_VARS["temperature"], coords)
     return xr.Dataset(
         {
-            "temperature":          t2m.rename("temperature"),
-            "soil temperature":     stl4.rename("soil temperature"),
-            "dewpoint temperature": d2m.rename("dewpoint temperature"),
+            "temperature":          v["t2m"].rename("temperature"),
+            "soil temperature":     v["stl4"].rename("soil temperature"),
+            "dewpoint temperature": v["d2m"].rename("dewpoint temperature"),
         }
     )
 
 
 def get_data_runoff(coords):
-    x0, y0, x1, y1 = _bbox(coords)
-    ro = _interp(
-        _collect_forecast("ro", coords, x0, y0, x1, y1, divide_by_3600=False),
-        coords,
-    )
-    return xr.Dataset({"runoff": ro.rename("runoff")})
+    v = _fetch_vars(_FEATURE_VARS["runoff"], coords)
+    return xr.Dataset({"runoff": v["ro"].rename("runoff")})
 
 
 def get_data_height(coords):
-    x0, y0, x1, y1 = _bbox(coords)
-    height = _interp(_retrieve_height(x0, y0, x1, y1), coords)
-    return xr.Dataset({"height": height.rename("height")})
+    v = _fetch_vars(_FEATURE_VARS["height"], coords)
+    return xr.Dataset({"height": v["z"].rename("height")})
 
 
 # ---------------------------------------------------------------------------

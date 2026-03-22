@@ -244,17 +244,17 @@ _an_sfc_url(product_dir, param_code, year, month)
 _fc_half_urls(product_dir, param_code, year, month)   → [first_half, second_half]
 _fc_prev_half_url(product_dir, param_code, year, month)
 _fc_to_hourly(subset, ncar_varname)    Flatten (init, hour, lat, lon) → (time, lat, lon)
-_retrieve_analysis(short_name, year, month, x0, y0, x1, y1)
-_retrieve_forecast_month(...)          Fetches prev + both halves; deduplicates
-_retrieve_height(x0, y0, x1, y1)
-_collect_analysis(short_name, coords, x0, y0, x1, y1)   Loops over months
-_collect_forecast(short_name, coords, x0, y0, x1, y1, divide_by_3600)
+_retrieve_var(short_name, year, month, x0, y0, x1, y1)
+                                       Unified fetch: dispatches to an.sfc / fc.sfc.accumu
+                                       / invariant path; inlines all download logic
+_fetch_vars(short_names, coords)       Submits all (var, month) tasks concurrently via
+                                       ThreadPoolExecutor; assembles + interpolates results
 _interp(da, coords)                    xr.interp to target x/y grid
-get_data_wind(coords)
-get_data_influx(coords)
-get_data_temperature(coords)
-get_data_runoff(coords)
-get_data_height(coords)
+get_data_wind(coords)                  Pure assembler: calls _fetch_vars, computes derived
+get_data_influx(coords)                Pure assembler: calls _fetch_vars, computes derived
+get_data_temperature(coords)           Pure assembler: calls _fetch_vars, computes derived
+get_data_runoff(coords)                Pure assembler: calls _fetch_vars, computes derived
+get_data_height(coords)                Pure assembler: calls _fetch_vars, computes derived
 get_data(cutout, feature, ...)         Entry point; same signature as era5.get_data()
 ```
 
@@ -276,16 +276,11 @@ python -m pytest test/test_preparation_and_conversion.py::TestERA5 \
 
 ### Performance
 
-The current implementation is sequential: one OPeNDAP request at a time.  For a
-full year × all features, this makes ~276 requests.  Each request takes 5–30 s
-depending on server load.  Total wall time: 20–90 minutes for a year.
-
-Potential speedups (not yet implemented):
-- **Concurrent requests**: use `concurrent.futures.ThreadPoolExecutor` to
-  parallelise across variables or months.  The `monthly_requests` +
-  `concurrent_requests` pattern from `era5.get_data()` would be a natural fit.
-- **Dask integration**: open multiple OPeNDAP datasets lazily and let dask
-  schedule the downloads.  Requires care to stay within the 500 MB/request limit.
+Concurrent downloads are implemented via `ThreadPoolExecutor` (default
+`MAX_WORKERS = 8`).  All `(short_name, year, month)` tasks for a feature are
+submitted to the pool simultaneously; results are assembled once all futures
+complete.  For a full year × all features this gives ~8× wall-time reduction
+over the previous sequential implementation.
 
 ### THREDDS reliability
 
