@@ -231,8 +231,8 @@ def _grids_align(ds, coords, tol=1e-4):
     if len(src_x) < 2 or len(tgt_x) < 2 or len(src_y) < 2 or len(tgt_y) < 2:
         return False
     return (
-        abs(float(np.diff(src_x[:2])) - float(np.diff(tgt_x[:2]))) < tol
-        and abs(float(np.diff(src_y[:2])) - float(np.diff(tgt_y[:2]))) < tol
+        abs(np.diff(src_x[:2]).item() - np.diff(tgt_x[:2]).item()) < tol
+        and abs(np.diff(src_y[:2]).item() - np.diff(tgt_y[:2]).item()) < tol
     )
 
 
@@ -558,6 +558,11 @@ def _fetch_vars(short_names, coords, tmpdir=None):
             ).load()
         for sn in assembled_tv:
             assembled[sn] = ds_tv_out[sn]
+
+    # Clear temp-file encoding (contiguous, source, original_shape) so it
+    # does not conflict with compression settings applied by cutout_prepare.
+    for da in assembled.values():
+        da.encoding.clear()
 
     # Clean up cache entries for this tmpdir now that all downloads and
     # assembly are done.  Entries from other tmpdirs (concurrent features
