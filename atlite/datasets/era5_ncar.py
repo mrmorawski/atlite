@@ -37,6 +37,9 @@ Technical notes
 
 import calendar
 import logging
+import os
+import tempfile
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,7 +55,36 @@ from atlite.pv.solar_position import SolarPosition
 
 logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 16  # concurrent OPeNDAP requests
+MAX_WORKERS = 8  # concurrent OPeNDAP requests
+
+# Fix 1: module-level semaphore caps total concurrent THREDDS connections
+# across all features that atlite prepares in parallel.
+_semaphore = threading.Semaphore(MAX_WORKERS)
+
+# Fix 2: per-(url, tmpdir) cache so the prev-half of month N+1 (== second-half
+# of month N) is not downloaded twice.
+_url_cache: dict[tuple[str, str], str] = {}
+_url_cache_lock = threading.Lock()          # guards _url_cache and _url_locks
+_url_locks: dict[tuple[str, str], threading.Lock] = {}
+
+# Fix 4: thread-local requests.Session for HTTP keep-alive reuse.
+_thread_local = threading.local()
+
+
+def _get_url_lock(cache_key: tuple[str, str]) -> threading.Lock:
+    """Return the per-URL lock, creating it if necessary (thread-safe)."""
+    with _url_cache_lock:
+        if cache_key not in _url_locks:
+            _url_locks[cache_key] = threading.Lock()
+        return _url_locks[cache_key]
+
+
+def _get_session():
+    """Return a thread-local requests.Session (created on first access)."""
+    if not hasattr(_thread_local, "session"):
+        import requests
+        _thread_local.session = requests.Session()
+    return _thread_local.session
 
 # ---------------------------------------------------------------------------
 # Module-level constants required by atlite
@@ -126,17 +158,23 @@ _BBOX_PAD = 0.5
 # OPeNDAP open + spatial subset
 # ---------------------------------------------------------------------------
 
+@retry(
+    wait=wait_random_exponential(multiplier=1, min=2, max=60),
+    stop=stop_after_attempt(5),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
 def _open_opendap(path):
     """Open an OPeNDAP dataset (lazy — metadata only).
 
     Uses ``engine="pydap"`` because netCDF4 is typically not compiled with
     OPeNDAP support.  The pydap DAP2 deprecation warning is suppressed.
+    Retried up to 5 times with random exponential backoff on transient errors.
     """
     url = OPENDAP_BASE + path
     logger.debug("era5-ncar OPeNDAP: %s", url)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return xr.open_dataset(url, engine="pydap")
+        return xr.open_dataset(url, engine="pydap", session=_get_session())
 
 
 def _sel_bbox(ds, x0, y0, x1, y1):
@@ -175,6 +213,26 @@ def _to_xy(da):
     return da.assign_coords(
         x=np.round(da.x.values.astype(float), 5),
         y=np.round(da.y.values.astype(float), 5),
+    )
+
+
+def _grids_align(ds, coords, tol=1e-4):
+    """Return True if ds and the target grid share the same resolution.
+
+    The fetched dataset is always larger than the target (padded by _BBOX_PAD),
+    so a shape/value equality check never passes.  Matching resolution is
+    sufficient: when True, `.sel(method="nearest")` extracts the target points
+    exactly rather than interpolating between them.
+    """
+    src_x = ds.coords["x"].values
+    src_y = ds.coords["y"].values
+    tgt_x = coords["x"].values
+    tgt_y = coords["y"].values
+    if len(src_x) < 2 or len(tgt_x) < 2 or len(src_y) < 2 or len(tgt_y) < 2:
+        return False
+    return (
+        abs(float(np.diff(src_x[:2])) - float(np.diff(tgt_x[:2]))) < tol
+        and abs(float(np.diff(src_y[:2])) - float(np.diff(tgt_y[:2]))) < tol
     )
 
 
@@ -242,7 +300,75 @@ def _fc_to_hourly(subset, ncar_varname):
             "longitude": subset["longitude"].values,
         },
         attrs=data.attrs,
-    ).sortby("time")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Forecast half-file helpers
+# ---------------------------------------------------------------------------
+
+def _retrieve_fc_half(url, ncar_var, x0, y0, x1, y1, tmpdir):
+    """Fetch one forecast half-file, write to a temp NetCDF file.
+
+    Results are cached by (url, tmpdir): the prev-half of month N+1 is the
+    same file as the second-half of month N, so the second caller returns the
+    cached path without a second OPeNDAP round-trip.
+
+    The DataArray has ``dims=["time", "latitude", "longitude"]``
+    (``_to_xy`` not yet applied).  The file has a single variable ``"data"``.
+    Assembly's ``sel(time=mt)`` filters to the correct month's timestamps, so
+    no init-time subsetting is required here.
+    """
+    cache_key = (url, str(tmpdir))
+    url_lock = _get_url_lock(cache_key)
+
+    with url_lock:
+        if cache_key in _url_cache:
+            return _url_cache[cache_key]
+
+        with _semaphore:
+            with _open_opendap(url) as ds:
+                subset = _sel_bbox(ds, x0, y0, x1, y1)
+                da = _fc_to_hourly(subset, ncar_var)
+
+        fd, path = tempfile.mkstemp(suffix=".nc", dir=tmpdir)
+        os.close(fd)
+        da.to_dataset(name="data").to_netcdf(path)
+        _url_cache[cache_key] = path
+        return path
+
+
+# ---------------------------------------------------------------------------
+# Analysis/invariant fetch helper
+# ---------------------------------------------------------------------------
+
+def _retrieve_var(short_name, year, month, x0, y0, x1, y1, tmpdir):
+    """Fetch one invariant or an.sfc variable, write to a temp NetCDF file.
+
+    Returns the path to the temp file.  The DataArray inside has y/x coords
+    (``_to_xy`` already applied).  The file has a single variable named
+    ``"data"``.
+    """
+    product_dir, param_code, ncar_var = VAR_MAP[short_name]
+
+    if product_dir == "e5.oper.invariant":
+        with _semaphore:
+            with _open_opendap(_INVARIANT_PATH) as ds:
+                subset = _sel_bbox(ds, x0, y0, x1, y1)
+                z = subset["Z"].isel(time=0, drop=True).load()
+        da = _to_xy(z / 9.80665)
+    else:
+        # e5.oper.an.sfc
+        url = _an_sfc_url(product_dir, param_code, year, month)
+        with _semaphore:
+            with _open_opendap(url) as ds:
+                subset = _sel_bbox(ds, x0, y0, x1, y1)
+                da = _to_xy(subset[ncar_var].load())
+
+    fd, path = tempfile.mkstemp(suffix=".nc", dir=tmpdir)
+    os.close(fd)
+    da.to_dataset(name="data").to_netcdf(path)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -264,59 +390,18 @@ def _bbox(coords):
     )
 
 
-@retry(
-    wait=wait_random_exponential(multiplier=1, min=2, max=60),
-    stop=stop_after_attempt(5),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-)
-def _retrieve_var(short_name, year, month, x0, y0, x1, y1):
-    """Fetch one variable for one month at native 0.25° resolution.
-
-    Returns a (time, y, x) DataArray, or (y, x) for the invariant height var.
-    Retried up to 5 times with random exponential backoff (2–60 s) on any
-    error, so transient THREDDS 500s and timeouts are handled automatically.
-    """
-    product_dir, param_code, ncar_var = VAR_MAP[short_name]
-
-    if product_dir == "e5.oper.invariant":
-        ds = _open_opendap(_INVARIANT_PATH)
-        subset = _sel_bbox(ds, x0, y0, x1, y1)
-        z = subset["Z"].isel(time=0, drop=True).load()
-        ds.close()
-        return _to_xy(z / 9.80665)
-
-    if product_dir == "e5.oper.an.sfc":
-        path = _an_sfc_url(product_dir, param_code, year, month)
-        ds = _open_opendap(path)
-        subset = _sel_bbox(ds, x0, y0, x1, y1)
-        da = _to_xy(subset[ncar_var].load())
-        ds.close()
-        return da
-
-    # fc.sfc.accumu — fetch prev half + both halves of the month
-    urls = [
-        _fc_prev_half_url(product_dir, param_code, year, month),
-        *_fc_half_urls(product_dir, param_code, year, month),
-    ]
-    parts = []
-    for url in urls:
-        ds = _open_opendap(url)
-        subset = _sel_bbox(ds, x0, y0, x1, y1)
-        parts.append(_fc_to_hourly(subset, ncar_var))
-        ds.close()
-    hourly = xr.concat(parts, dim="time").sortby("time")
-    _, idx = np.unique(hourly.time.values, return_index=True)
-    hourly = hourly.isel(time=idx)
-    if short_name in _FC_DIVIDE_BY_3600:
-        hourly = hourly / 3600.0
-    return _to_xy(hourly)
-
-
-def _fetch_vars(short_names, coords):
+def _fetch_vars(short_names, coords, tmpdir=None):
     """Fetch all requested variables concurrently.
 
-    Submits one task per (short_name, year, month) combination to a thread
-    pool, concatenates monthly results, and interpolates to the cutout grid.
+    Each task downloads its data to a temporary NetCDF file, then all files
+    are opened lazily (dask-backed) so assembly and interpolation do not hold
+    multiple variables in RAM simultaneously.
+
+    Each forecast half-file is its own parallel task (one task per URL), so
+    the thread pool parallelises across both (var, month) and the three
+    half-files within each forecast month.  Results are assembled and
+    interpolated to the cutout grid as a single Dataset per group (static /
+    time-varying) to avoid redundant grid-weight computation.
 
     Returns a dict mapping short_name → DataArray on the cutout's (time, y, x)
     grid (or (y, x) for the invariant height variable).
@@ -325,14 +410,25 @@ def _fetch_vars(short_names, coords):
     months = _months(coords)
     t = pd.DatetimeIndex(coords["time"].values)
 
-    # Build task list; invariant vars need only one fetch (no month loop).
+    # Build task list.
+    # Each task is a tuple: (kind, sn, year, month, url)
+    #   kind ∈ {"invariant", "an_sfc", "fc_half"}
     tasks = []
     for sn in short_names:
-        if VAR_MAP[sn][0] == "e5.oper.invariant":
-            tasks.append((sn, None, None))
+        product_dir, param_code, ncar_var = VAR_MAP[sn]
+        if product_dir == "e5.oper.invariant":
+            tasks.append(("invariant", sn, None, None, None))
+        elif product_dir == "e5.oper.an.sfc":
+            for year, month in months:
+                tasks.append(("an_sfc", sn, year, month, None))
         else:
             for year, month in months:
-                tasks.append((sn, year, month))
+                urls = [
+                    _fc_prev_half_url(product_dir, param_code, year, month),
+                    *_fc_half_urls(product_dir, param_code, year, month),
+                ]
+                for url in urls:
+                    tasks.append(("fc_half", sn, year, month, url))
 
     n_total = len(tasks)
     logger.info(
@@ -341,14 +437,27 @@ def _fetch_vars(short_names, coords):
     )
     t_start = time.time()
 
-    raw = {}  # (short_name, year, month) → DataArray
+    # raw storage (workers return paths to temp NetCDF files):
+    #   ("invariant", sn)            → str path
+    #   ("an_sfc", sn, year, month)  → str path
+    #   ("fc_half", sn, year, month) → list of str paths (one per half-file)
+    raw = {}
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(_retrieve_var, sn, yr, mo, x0, y0, x1, y1): (sn, yr, mo)
-            for sn, yr, mo in tasks
-        }
-        for n_done, future in enumerate(as_completed(futures), 1):
-            sn, yr, mo = futures[future]
+        future_map = {}
+        for kind, sn, yr, mo, url in tasks:
+            if kind == "invariant":
+                f = pool.submit(_retrieve_var, sn, None, None, x0, y0, x1, y1, tmpdir)
+            elif kind == "an_sfc":
+                f = pool.submit(_retrieve_var, sn, yr, mo, x0, y0, x1, y1, tmpdir)
+            else:
+                _, _, ncar_var = VAR_MAP[sn]
+                f = pool.submit(_retrieve_fc_half, url, ncar_var, x0, y0, x1, y1, tmpdir)
+            future_map[f] = (kind, sn, yr, mo)
+
+        for n_done, future in enumerate(as_completed(future_map), 1):
+            kind, sn, yr, mo = future_map[future]
+            result = future.result()  # raises immediately on worker error
             elapsed = time.time() - t_start
             rate = elapsed / n_done
             eta = rate * (n_total - n_done)
@@ -356,52 +465,127 @@ def _fetch_vars(short_names, coords):
                 "era5-ncar: [%d/%d] %-6s %s-%02d  (%.0fs elapsed, ETA %.0fs)",
                 n_done, n_total, sn, yr if yr else "—", mo or 0, elapsed, eta,
             )
-            raw[(sn, yr, mo)] = future.result()
+            if kind == "invariant":
+                raw[("invariant", sn)] = result
+            elif kind == "an_sfc":
+                raw[("an_sfc", sn, yr, mo)] = result
+            else:
+                fc_key = ("fc_half", sn, yr, mo)
+                if fc_key not in raw:
+                    raw[fc_key] = []
+                raw[fc_key].append(result)
 
-    # Assemble per-variable: select target times, concatenate months, interpolate.
-    assembled = {}
+    # Open temp files lazily (dask-backed) and assemble per-variable.
+    assembled_static = {}
+    assembled_tv = {}
+
     for sn in short_names:
-        if VAR_MAP[sn][0] == "e5.oper.invariant":
-            assembled[sn] = _interp(raw[(sn, None, None)], coords)
-        else:
+        product_dir = VAR_MAP[sn][0]
+
+        if product_dir == "e5.oper.invariant":
+            path = raw[("invariant", sn)]
+            # Invariant is small (y, x) — open without time chunking.
+            assembled_static[sn] = xr.open_dataset(path, chunks={})["data"]
+
+        elif product_dir == "e5.oper.an.sfc":
             parts = []
             for year, month in months:
-                da = raw[(sn, year, month)]
+                path = raw[("an_sfc", sn, year, month)]
+                da = xr.open_dataset(path, chunks={"time": 24})["data"]
                 mt = t[(t.year == year) & (t.month == month)]
                 if len(mt):
-                    sel = da.sel(time=mt, method="nearest").assign_coords(time=mt.values)
+                    sel = (
+                        da.sel(time=mt, method="nearest", tolerance=pd.Timedelta("30min"))
+                        .assign_coords(time=mt.values)
+                    )
                     parts.append(sel)
-            assembled[sn] = _interp(xr.concat(parts, dim="time"), coords)
+            assembled_tv[sn] = xr.concat(parts, dim="time")
+
+        else:
+            # fc.sfc.accumu — assemble half-files per month, then concat months.
+            # Temp files have latitude/longitude coords; _to_xy applied below.
+            month_parts = []
+            for year, month in months:
+                paths = raw[("fc_half", sn, year, month)]
+                parts = [
+                    xr.open_dataset(p, chunks={"time": 24})["data"]
+                    for p in paths
+                ]
+                hourly = xr.concat(parts, dim="time")
+                # Deduplicate on the time coordinate (small, safe to load).
+                _, idx = np.unique(hourly.time.values, return_index=True)
+                hourly = hourly.isel(time=idx)
+                if sn in _FC_DIVIDE_BY_3600:
+                    hourly = hourly / 3600.0
+                hourly = _to_xy(hourly)
+                mt = t[(t.year == year) & (t.month == month)]
+                if len(mt):
+                    sel = (
+                        hourly.sel(time=mt, method="nearest", tolerance=pd.Timedelta("30min"))
+                        .assign_coords(time=mt.values)
+                    )
+                    month_parts.append(sel)
+            assembled_tv[sn] = xr.concat(month_parts, dim="time")
+
+    # Batch interpolation: one .interp() call per group to reuse grid weights.
+    # .load() is called on each interpolated Dataset to materialise the result
+    # at the (smaller) target-grid resolution, which releases the file handles
+    # opened above and allows tmpdir cleanup on all platforms.
+    assembled = {}
+
+    if assembled_static:
+        ds_static = xr.Dataset(assembled_static)
+        if _grids_align(ds_static, coords):
+            ds_static_out = ds_static.sel(
+                x=coords["x"].values, y=coords["y"].values, method="nearest"
+            ).load()
+        else:
+            ds_static_out = ds_static.interp(
+                x=coords["x"].values, y=coords["y"].values, method="linear"
+            ).load()
+        for sn in assembled_static:
+            assembled[sn] = ds_static_out[sn]
+
+    if assembled_tv:
+        ds_tv = xr.Dataset(assembled_tv)
+        if _grids_align(ds_tv, coords):
+            ds_tv_out = ds_tv.sel(
+                x=coords["x"].values, y=coords["y"].values, method="nearest"
+            ).load()
+        else:
+            ds_tv_out = ds_tv.interp(
+                x=coords["x"].values, y=coords["y"].values, method="linear"
+            ).load()
+        for sn in assembled_tv:
+            assembled[sn] = ds_tv_out[sn]
+
+    # Clean up cache entries for this tmpdir now that all downloads and
+    # assembly are done.  Entries from other tmpdirs (concurrent features
+    # sharing a different prepare() call) are left untouched.
+    if tmpdir is not None:
+        tmpdir_str = str(tmpdir)
+        with _url_cache_lock:
+            stale = [k for k in _url_cache if k[1] == tmpdir_str]
+            for k in stale:
+                del _url_cache[k]
+                _url_locks.pop(k, None)
 
     return assembled
-
-
-def _interp(da, coords):
-    """Bilinearly interpolate *da* (y, x) to the cutout's target grid."""
-    return da.interp(
-        x=coords["x"].values,
-        y=coords["y"].values,
-        method="linear",
-    )
 
 
 # ---------------------------------------------------------------------------
 # Feature assemblers  (receive pre-fetched vars dict, compute derived fields)
 # ---------------------------------------------------------------------------
 
-def get_data_wind(coords):
-    v = _fetch_vars(_FEATURE_VARS["wind"], coords)
+def get_data_wind(coords, tmpdir=None):
+    v = _fetch_vars(_FEATURE_VARS["wind"], coords, tmpdir=tmpdir)
     wnd10m  = np.sqrt(v["u10"]**2  + v["v10"]**2)
     wnd100m = np.sqrt(v["u100"]**2 + v["v100"]**2)
     wnd_shear_exp = (
         np.log(wnd10m / wnd100m) / np.log(10.0 / 100.0)
     ).assign_attrs(units="", long_name="wind shear exponent")
-    az = np.arctan2(v["u100"].values, v["v100"].values)
-    wnd_azimuth = xr.DataArray(
-        np.where(az >= 0, az, az + 2 * np.pi),
-        dims=wnd100m.dims,
-        coords=wnd100m.coords,
-    )
+    az = np.arctan2(v["u100"], v["v100"])  # stays lazy via __array_ufunc__
+    wnd_azimuth = az.where(az >= 0, az + 2 * np.pi)
     return xr.Dataset(
         {
             "wnd100m":       wnd100m.rename("wnd100m"),
@@ -412,8 +596,8 @@ def get_data_wind(coords):
     )
 
 
-def get_data_influx(coords):
-    v = _fetch_vars(_FEATURE_VARS["influx"], coords)
+def get_data_influx(coords, tmpdir=None):
+    v = _fetch_vars(_FEATURE_VARS["influx"], coords, tmpdir=tmpdir)
     ssrd, ssr, fdir, tisr = v["ssrd"], v["ssr"], v["fdir"], v["tisr"]
     albedo         = ((ssrd - ssr) / ssrd.where(ssrd != 0)).fillna(0.0)
     influx_diffuse = ssrd - fdir
@@ -433,8 +617,8 @@ def get_data_influx(coords):
     return xr.merge([ds, sp])
 
 
-def get_data_temperature(coords):
-    v = _fetch_vars(_FEATURE_VARS["temperature"], coords)
+def get_data_temperature(coords, tmpdir=None):
+    v = _fetch_vars(_FEATURE_VARS["temperature"], coords, tmpdir=tmpdir)
     return xr.Dataset(
         {
             "temperature":          v["t2m"].rename("temperature"),
@@ -444,13 +628,13 @@ def get_data_temperature(coords):
     )
 
 
-def get_data_runoff(coords):
-    v = _fetch_vars(_FEATURE_VARS["runoff"], coords)
+def get_data_runoff(coords, tmpdir=None):
+    v = _fetch_vars(_FEATURE_VARS["runoff"], coords, tmpdir=tmpdir)
     return xr.Dataset({"runoff": v["ro"].rename("runoff")})
 
 
-def get_data_height(coords):
-    v = _fetch_vars(_FEATURE_VARS["height"], coords)
+def get_data_height(coords, tmpdir=None):
+    v = _fetch_vars(_FEATURE_VARS["height"], coords, tmpdir=tmpdir)
     return xr.Dataset({"height": v["z"].rename("height")})
 
 
@@ -476,7 +660,16 @@ def get_data(cutout, feature, tmpdir=None, lock=None, **creation_parameters):
         )
 
     logger.info("era5-ncar: fetching feature '%s'...", feature)
-    ds = func(coords)
+
+    if tmpdir is not None:
+        # Normal workflow: atlite's prepare machinery manages tmpdir lifecycle.
+        ds = func(coords, tmpdir=tmpdir)
+    else:
+        # Direct call with no tmpdir: use a TemporaryDirectory so temp files
+        # are cleaned up automatically.  _fetch_vars already .load()s after
+        # interpolation, so ds is in-memory when the context exits.
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            ds = func(coords, tmpdir=_tmpdir)
 
     if sanitize and sanitize_func is not None:
         ds = sanitize_func(ds)
