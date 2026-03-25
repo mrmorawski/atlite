@@ -45,6 +45,8 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import traceback
+
 import requests.exceptions
 from tenacity import (
     before_sleep_log,
@@ -74,10 +76,27 @@ _nc_write_lock = threading.Lock()
 _thread_local = threading.local()
 
 
+_REQUEST_TIMEOUT = (30, 300)  # (connect, read) seconds
+
+
 def _get_session():
-    """Return a thread-local requests.Session (created on first access)."""
+    """Return a thread-local requests.Session (created on first access).
+
+    A default timeout is set via a mounted adapter so that stalled THREDDS
+    connections don't block a pool thread indefinitely.
+    """
     if not hasattr(_thread_local, "session"):
-        _thread_local.session = requests.Session()
+        from requests.adapters import HTTPAdapter
+
+        class _TimeoutAdapter(HTTPAdapter):
+            def send(self, *args, **kwargs):
+                kwargs.setdefault("timeout", _REQUEST_TIMEOUT)
+                return super().send(*args, **kwargs)
+
+        s = requests.Session()
+        s.mount("http://", _TimeoutAdapter())
+        s.mount("https://", _TimeoutAdapter())
+        _thread_local.session = s
     return _thread_local.session
 
 
@@ -316,17 +335,6 @@ def _cache_key(short_name, x0, y0, x1, y1, year=None, month=None, url=None):
         return f"era5_ncar_{short_name}_inv_{bbox_hash}.nc"
 
 
-@retry(
-    wait=wait_random_exponential(multiplier=1, min=2, max=60),
-    stop=stop_after_attempt(5),
-    retry=retry_if_exception_type(
-        (
-            requests.exceptions.ChunkedEncodingError,
-            requests.exceptions.ConnectionError,
-        )
-    ),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-)
 def _retrieve_var(short_name, x0, y0, x1, y1, tmpdir, year=None, month=None, url=None):
     """Fetch one ERA5 variable from NCAR OPeNDAP, write to a temp NetCDF file.
 
@@ -346,10 +354,34 @@ def _retrieve_var(short_name, x0, y0, x1, y1, tmpdir, year=None, month=None, url
     cache_name = _cache_key(short_name, x0, y0, x1, y1, year, month, url)
     path = os.path.join(tmpdir, cache_name)
     if os.path.exists(path) and os.path.getsize(path) > 0:
-        logger.debug("era5-ncar: cache hit for %s", cache_name)
+        logger.info("era5-ncar: cache hit for %s", cache_name)
         return path
 
     product_dir, param_code, ncar_var = VAR_MAP[short_name]
+    _retrieve_var_inner(
+        short_name, x0, y0, x1, y1, tmpdir, path, product_dir, param_code, ncar_var,
+        year=year, month=month, url=url,
+    )
+    return path
+
+
+@retry(
+    wait=wait_random_exponential(multiplier=1, min=2, max=120),
+    stop=stop_after_attempt(8),
+    retry=retry_if_exception_type(
+        (requests.exceptions.RequestException, OSError)
+    ),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
+def _retrieve_var_inner(
+    short_name, x0, y0, x1, y1, tmpdir, path, product_dir, param_code, ncar_var,
+    year=None, month=None, url=None,
+):
+    """Download + write, with retries. Called by _retrieve_var after cache check."""
+    logger.debug(
+        "era5-ncar: fetching %s year=%s month=%s url=%s",
+        short_name, year, month, url,
+    )
 
     if product_dir == "e5.oper.invariant":
         with _open_opendap(_INVARIANT_PATH) as ds:
@@ -357,8 +389,8 @@ def _retrieve_var(short_name, x0, y0, x1, y1, tmpdir, year=None, month=None, url
             z = subset["Z"].isel(time=0, drop=True).load()
         da = _to_xy(z / 9.80665)
     elif product_dir == "e5.oper.an.sfc":
-        url = _an_sfc_url(product_dir, param_code, year, month)
-        with _open_opendap(url) as ds:
+        an_url = _an_sfc_url(product_dir, param_code, year, month)
+        with _open_opendap(an_url) as ds:
             subset = _sel_bbox(ds, x0, y0, x1, y1)
             da = _to_xy(subset[ncar_var].load())
     else:
@@ -381,7 +413,6 @@ def _retrieve_var(short_name, x0, y0, x1, y1, tmpdir, year=None, month=None, url
         except OSError:
             pass
         raise
-    return path
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +461,31 @@ def _fetch_vars(short_names, coords, tmpdir=None):
     x0, y0, x1, y1 = _bbox(coords)
     months = _months(coords)
     t = pd.DatetimeIndex(coords["time"].values)
+
+    # ------------------------------------------------------------------
+    # File-level debug logging (written to tmpdir/era5_ncar.log).
+    # ------------------------------------------------------------------
+    # Attach a file handler once (first call); subsequent calls reuse it.
+    _already = any(
+        isinstance(h, logging.FileHandler)
+        and getattr(h, "_era5_ncar_logfile", False)
+        for h in logger.handlers
+    )
+    if tmpdir is not None and not _already:
+        log_path = os.path.join(tmpdir, "era5_ncar.log")
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(threadName)s %(levelname)s %(message)s")
+        )
+        file_handler._era5_ncar_logfile = True
+        logger.addHandler(file_handler)
+        # Lower the logger gate so DEBUG reaches the file handler.  Console
+        # handlers keep their own level filters, so this won't spam stdout.
+        if logger.level > logging.DEBUG:
+            logger.setLevel(logging.DEBUG)
+        logger.debug("era5-ncar: logfile %s, bbox=(%.3f,%.3f,%.3f,%.3f), months=%s",
+                      log_path, x0, y0, x1, y1, months)
 
     # ------------------------------------------------------------------
     # Phase 1: Submit all download tasks in parallel.
@@ -484,7 +540,15 @@ def _fetch_vars(short_names, coords, tmpdir=None):
 
     try:
         for n_done, future in enumerate(as_completed(all_futures), 1):
-            future.result()
+            try:
+                future.result()
+            except Exception:
+                label = all_futures[future]
+                logger.error(
+                    "era5-ncar: FAILED %s after retries:\n%s",
+                    label, traceback.format_exc(),
+                )
+                raise
             elapsed = time.time() - t_start
             eta = (elapsed / n_done) * (len(all_futures) - n_done)
             logger.info(
@@ -509,85 +573,100 @@ def _fetch_vars(short_names, coords, tmpdir=None):
     # ------------------------------------------------------------------
     assembled = {}
 
-    for sn in short_names:
-        product_dir = VAR_MAP[sn][0]
+    # The entire consolidation phase must be serialized because the netCDF4/HDF5
+    # C library is not thread-safe — concurrent open_dataset() calls from
+    # multiple dask threads cause "double free" crashes.  Downloads (Phase 1)
+    # remain fully parallel since they use pydap (pure Python, thread-safe).
+    with _nc_write_lock:
+        for sn in short_names:
+            # Check consolidated cache first (before opening raw files).
+            consolidated_path = os.path.join(tmpdir, f"consolidated_{sn}.nc")
+            if os.path.exists(consolidated_path) and os.path.getsize(consolidated_path) > 0:
+                logger.info("era5-ncar: consolidated cache hit for %s", sn)
+                da_out = xr.open_dataset(consolidated_path, chunks={"time": 24})["data"]
+                da_out.encoding.clear()
+                assembled[sn] = da_out
+                continue
 
-        if product_dir == "e5.oper.invariant":
-            path = inv_futures[sn].result()
-            da = xr.open_dataset(path, chunks={})["data"]
+            product_dir = VAR_MAP[sn][0]
+            raw_datasets = []  # track for cleanup
 
-        elif product_dir == "e5.oper.an.sfc":
-            parts = []
-            for year, month in months:
-                path = an_futures[(sn, year, month)].result()
-                chunk = xr.open_dataset(path, chunks={"time": 24})["data"]
-                mt = t[(t.year == year) & (t.month == month)]
-                if len(mt):
-                    parts.append(
-                        chunk.sel(
-                            time=mt, method="nearest", tolerance=pd.Timedelta("30min")
-                        ).assign_coords(time=mt.values)
-                    )
-            da = xr.concat(parts, dim="time")
+            if product_dir == "e5.oper.invariant":
+                path = inv_futures[sn].result()
+                raw_ds = xr.open_dataset(path, chunks={})
+                raw_datasets.append(raw_ds)
+                da = raw_ds["data"]
 
-        else:
-            # fc.sfc.accumu
-            month_parts = []
-            for year, month in months:
-                paths = [fc_futures[url].result() for url in fc_urls[(sn, year, month)]]
-                chunks = [
-                    xr.open_dataset(p, chunks={"time": 24})["data"] for p in paths
-                ]
-                hourly = xr.concat(chunks, dim="time")
-                _, idx = np.unique(hourly.time.values, return_index=True)
-                hourly = hourly.isel(time=idx)
-                if sn in _FC_DIVIDE_BY_3600:
-                    hourly = hourly / 3600.0
-                hourly = _to_xy(hourly)
-                mt = t[(t.year == year) & (t.month == month)]
-                if len(mt):
-                    month_parts.append(
-                        hourly.sel(
-                            time=mt, method="nearest", tolerance=pd.Timedelta("30min")
-                        ).assign_coords(time=mt.values)
-                    )
-            da = xr.concat(month_parts, dim="time")
+            elif product_dir == "e5.oper.an.sfc":
+                parts = []
+                for year, month in months:
+                    path = an_futures[(sn, year, month)].result()
+                    raw_ds = xr.open_dataset(path, chunks={"time": 24})
+                    raw_datasets.append(raw_ds)
+                    chunk = raw_ds["data"]
+                    mt = t[(t.year == year) & (t.month == month)]
+                    if len(mt):
+                        parts.append(
+                            chunk.sel(
+                                time=mt, method="nearest", tolerance=pd.Timedelta("30min")
+                            ).assign_coords(time=mt.values)
+                        )
+                da = xr.concat(parts, dim="time")
 
-        # Interpolate to target grid.
-        ds_one = xr.Dataset({sn: da})
-        if _grids_align(ds_one, coords):
-            result = ds_one.sel(
-                x=coords["x"].values, y=coords["y"].values, method="nearest"
-            )[sn]
-        else:
-            result = ds_one.interp(
-                x=coords["x"].values, y=coords["y"].values, method="linear"
-            )[sn]
-        result.encoding.clear()
+            else:
+                # fc.sfc.accumu
+                month_parts = []
+                for year, month in months:
+                    paths = [fc_futures[url].result() for url in fc_urls[(sn, year, month)]]
+                    chunks = []
+                    for p in paths:
+                        raw_ds = xr.open_dataset(p, chunks={"time": 24})
+                        raw_datasets.append(raw_ds)
+                        chunks.append(raw_ds["data"])
+                    hourly = xr.concat(chunks, dim="time")
+                    _, idx = np.unique(hourly.time.values, return_index=True)
+                    hourly = hourly.isel(time=idx)
+                    if sn in _FC_DIVIDE_BY_3600:
+                        hourly = hourly / 3600.0
+                    hourly = _to_xy(hourly)
+                    mt = t[(t.year == year) & (t.month == month)]
+                    if len(mt):
+                        month_parts.append(
+                            hourly.sel(
+                                time=mt, method="nearest", tolerance=pd.Timedelta("30min")
+                            ).assign_coords(time=mt.values)
+                        )
+                da = xr.concat(month_parts, dim="time")
 
-        # Consolidate: eagerly compute this variable (reads temp files,
-        # interpolates, time-selects) and write one clean uncompressed
-        # NetCDF at target resolution.  Re-open lazily so the final
-        # to_netcdf() in cutout_prepare sees a simple dask graph of ~13
-        # files instead of ~222.
-        consolidated_path = os.path.join(tmpdir, f"consolidated_{sn}.nc")
-        if os.path.exists(consolidated_path) and os.path.getsize(consolidated_path) > 0:
-            logger.info("era5-ncar: consolidated cache hit for %s", sn)
+            # Interpolate to target grid.
+            ds_one = xr.Dataset({sn: da})
+            if _grids_align(ds_one, coords):
+                result = ds_one.sel(
+                    x=coords["x"].values, y=coords["y"].values, method="nearest"
+                )[sn]
+            else:
+                result = ds_one.interp(
+                    x=coords["x"].values, y=coords["y"].values, method="linear"
+                )[sn]
+            result.encoding.clear()
+
+            # Consolidate: eagerly compute this variable and write one clean
+            # uncompressed NetCDF at target resolution.
+            logger.info("era5-ncar: consolidating %s to %s", sn, consolidated_path)
+            to_write = xr.Dataset({"data": result})
+            for v in to_write.data_vars:
+                to_write[v].encoding.clear()
+            tmp_consolidated = consolidated_path + ".tmp"
+            to_write.compute(scheduler="synchronous").to_netcdf(tmp_consolidated)
+
+            # Close raw temp file handles now that data is materialized.
+            for raw_ds in raw_datasets:
+                raw_ds.close()
+
+            os.rename(tmp_consolidated, consolidated_path)
             da_out = xr.open_dataset(consolidated_path, chunks={"time": 24})["data"]
             da_out.encoding.clear()
             assembled[sn] = da_out
-            continue
-        logger.info("era5-ncar: consolidating %s to %s", sn, consolidated_path)
-        to_write = xr.Dataset({"data": result})
-        for v in to_write.data_vars:
-            to_write[v].encoding.clear()
-        tmp_consolidated = consolidated_path + ".tmp"
-        with _nc_write_lock:
-            to_write.to_netcdf(tmp_consolidated)
-            os.rename(tmp_consolidated, consolidated_path)
-        da_out = xr.open_dataset(consolidated_path, chunks={"time": 24})["data"]
-        da_out.encoding.clear()
-        assembled[sn] = da_out
 
     return assembled
 
@@ -609,7 +688,8 @@ def get_data_wind(coords, tmpdir=None):
     return xr.Dataset(
         {
             "wnd100m": wnd100m.rename("wnd100m"),
-            "wnd_shear_exp": wnd_shear_exp.rename("wnd_shear_exp"),
+            # np.log promotes float32→float64; cast back to match input precision
+            "wnd_shear_exp": wnd_shear_exp.astype("float32").rename("wnd_shear_exp"),
             "wnd_azimuth": wnd_azimuth.rename("wnd_azimuth"),
             "roughness": v["fsr"].rename("roughness"),
         }
@@ -634,6 +714,8 @@ def get_data_influx(coords, tmpdir=None):
         warnings.simplefilter("ignore", DeprecationWarning)
         sp = SolarPosition(ds, time_shift=pd.to_timedelta("-30 minutes"))
     sp = sp.rename({name: f"solar_{name}" for name in sp.data_vars})
+    # SolarPosition trig promotes float32→float64; cast back to save disk/RAM
+    sp = sp.astype("float32")
     return xr.merge([ds, sp])
 
 

@@ -78,8 +78,15 @@ def _progress_reporter(
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default="europe_2013_ncar.nc", type=Path)
+    parser.add_argument(
+        "--tmpdir",
+        default=None,
+        type=Path,
+        help="Persistent cache dir for resumable downloads",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -99,7 +106,9 @@ def main():
     nt = len(cutout.coords["time"])
     logger.info(
         "Grid: %d × %d (lon × lat), %d timesteps (%.1f°×%.1f° at 0.25° native)",
-        nx, ny, nt,
+        nx,
+        ny,
+        nt,
         float(cutout.coords["x"].max()) - float(cutout.coords["x"].min()),
         float(cutout.coords["y"].max()) - float(cutout.coords["y"].min()),
     )
@@ -118,7 +127,9 @@ def main():
     t0 = time.time()
     reporter.start()
     try:
-        cutout.prepare(features=ALL_FEATURES)
+        cutout.prepare(
+            features=ALL_FEATURES, tmpdir=str(args.tmpdir) if args.tmpdir else None
+        )
     finally:
         stop_event.set()
         reporter.join()
@@ -128,7 +139,9 @@ def main():
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
-    output_size_mb = args.output.stat().st_size / 1e6 if args.output.exists() else float("nan")
+    output_size_mb = (
+        args.output.stat().st_size / 1e6 if args.output.exists() else float("nan")
+    )
 
     print()
     print("=" * 60)
@@ -136,7 +149,7 @@ def main():
     print("=" * 60)
     print(f"  Output:          {args.output}  ({output_size_mb:.0f} MB)")
     print(f"  Grid:            {nx} × {ny} lon/lat,  {nt} timesteps")
-    print(f"  Total wall time: {elapsed/60:.1f} min")
+    print(f"  Total wall time: {elapsed / 60:.1f} min")
     print("=" * 60)
 
 
