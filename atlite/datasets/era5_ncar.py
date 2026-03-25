@@ -167,6 +167,11 @@ _FC_DIVIDE_BY_3600 = {"ssrd", "ssr", "fdir", "tisr"}
 # data, so bilinear interpolation has support even at the target grid edges.
 _BBOX_PAD = 0.5
 
+# Chunk size (hours) for consolidated files.  Larger chunks reduce dask graph
+# overhead and improve compression ratio in the final cutout write.  720 h
+# ≈ 30 days, giving ~12 chunks per year instead of ~365.
+_CONSOLIDATED_CHUNKS = {"time": 720}
+
 
 # ---------------------------------------------------------------------------
 # OPeNDAP open + spatial subset
@@ -583,7 +588,7 @@ def _fetch_vars(short_names, coords, tmpdir=None):
             consolidated_path = os.path.join(tmpdir, f"consolidated_{sn}.nc")
             if os.path.exists(consolidated_path) and os.path.getsize(consolidated_path) > 0:
                 logger.info("era5-ncar: consolidated cache hit for %s", sn)
-                da_out = xr.open_dataset(consolidated_path, chunks={"time": 24})["data"]
+                da_out = xr.open_dataset(consolidated_path, chunks=_CONSOLIDATED_CHUNKS)["data"]
                 da_out.encoding.clear()
                 assembled[sn] = da_out
                 continue
@@ -651,20 +656,26 @@ def _fetch_vars(short_names, coords, tmpdir=None):
             result.encoding.clear()
 
             # Consolidate: eagerly compute this variable and write one clean
-            # uncompressed NetCDF at target resolution.
+            # uncompressed NetCDF at target resolution.  Explicit HDF5
+            # chunksizes match the dask chunks used when re-reading, avoiding
+            # a costly chunk-boundary mismatch during the final write.
             logger.info("era5-ncar: consolidating %s to %s", sn, consolidated_path)
-            to_write = xr.Dataset({"data": result})
+            computed = result.compute(scheduler="synchronous")
+            to_write = xr.Dataset({"data": computed})
+            chunksizes = [min(_CONSOLIDATED_CHUNKS.get(d, s), s)
+                          for d, s in zip(computed.dims, computed.shape)]
             for v in to_write.data_vars:
                 to_write[v].encoding.clear()
+                to_write[v].encoding["chunksizes"] = chunksizes
             tmp_consolidated = consolidated_path + ".tmp"
-            to_write.compute(scheduler="synchronous").to_netcdf(tmp_consolidated)
+            to_write.to_netcdf(tmp_consolidated)
 
             # Close raw temp file handles now that data is materialized.
             for raw_ds in raw_datasets:
                 raw_ds.close()
 
             os.rename(tmp_consolidated, consolidated_path)
-            da_out = xr.open_dataset(consolidated_path, chunks={"time": 24})["data"]
+            da_out = xr.open_dataset(consolidated_path, chunks=_CONSOLIDATED_CHUNKS)["data"]
             da_out.encoding.clear()
             assembled[sn] = da_out
 

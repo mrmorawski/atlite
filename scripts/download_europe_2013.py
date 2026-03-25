@@ -128,7 +128,9 @@ def main():
     reporter.start()
     try:
         cutout.prepare(
-            features=ALL_FEATURES, tmpdir=str(args.tmpdir) if args.tmpdir else None
+            features=ALL_FEATURES,
+            tmpdir=str(args.tmpdir) if args.tmpdir else None,
+            compression={"zlib": True, "complevel": 1, "shuffle": True},
         )
     finally:
         stop_event.set()
