@@ -47,7 +47,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests.exceptions
 from tqdm import tqdm
-from tqdm.contrib.logging import logging_redirect_tqdm
 from tenacity import (
     before_sleep_log,
     retry,
@@ -65,8 +64,10 @@ from atlite.pv.solar_position import SolarPosition
 
 logger = logging.getLogger(__name__)
 
-# Suppress pydap's per-request INFO chatter — it's our transport layer.
+# Suppress noisy transport-layer loggers — retries are already reported
+# through tenacity's before_sleep_log on the atlite.datasets.era5_ncar logger.
 logging.getLogger("pydap").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 MAX_WORKERS = 8  # concurrent OPeNDAP requests
 
@@ -465,7 +466,7 @@ def _bbox(coords):
     )
 
 
-def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar"):
+def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar", show_progress=False):
     """Fetch variables with parallel downloads, return lazy dask DataArrays.
 
     Architecture:
@@ -491,7 +492,7 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar"):
     """
     if tmpdir is None:
         with tempfile.TemporaryDirectory() as _tmpdir:
-            assembled = _fetch_vars(short_names, coords, tmpdir=_tmpdir, lock=lock, desc=desc)
+            assembled = _fetch_vars(short_names, coords, tmpdir=_tmpdir, lock=lock, desc=desc, show_progress=show_progress)
             return {sn: da.load() for sn, da in assembled.items()}
 
     x0, y0, x1, y1 = _bbox(coords)
@@ -556,27 +557,24 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar"):
                         fc_futures[url] = f
                         all_futures[f] = f"{sn} {year}-{month:02d}"
 
-    show_bar = logger.isEnabledFor(logging.INFO)
     try:
-        with logging_redirect_tqdm():
-            with tqdm(
-                as_completed(all_futures),
-                total=len(all_futures),
-                disable=not show_bar,
-                unit="file",
-                desc=desc,
-            ) as bar:
-                for future in bar:
-                    try:
-                        future.result()
-                    except Exception:
-                        logger.error(
-                            "era5-ncar: FAILED %s after retries:\n%s",
-                            all_futures[future],
-                            traceback.format_exc(),
-                        )
-                        raise
-                    logger.debug("era5-ncar: done %s", all_futures[future])
+        with tqdm(
+            as_completed(all_futures),
+            total=len(all_futures),
+            disable=not show_progress,
+            unit="file",
+            desc=desc,
+        ) as bar:
+            for future in bar:
+                try:
+                    future.result()
+                except Exception:
+                    logger.error(
+                        "era5-ncar: FAILED %s after retries:\n%s",
+                        all_futures[future],
+                        traceback.format_exc(),
+                    )
+                    raise
     except BaseException:
         for f in all_futures:
             f.cancel()
@@ -671,8 +669,8 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar"):
 # ---------------------------------------------------------------------------
 
 
-def get_data_wind(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["wind"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar wind")
+def get_data_wind(coords, tmpdir=None, lock=None, show_progress=False):
+    v = _fetch_vars(_FEATURE_VARS["wind"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar wind", show_progress=show_progress)
     wnd10m = np.sqrt(v["u10"] ** 2 + v["v10"] ** 2)
     wnd100m = np.sqrt(v["u100"] ** 2 + v["v100"] ** 2)
     wnd_shear_exp = (np.log(wnd10m / wnd100m) / np.log(10.0 / 100.0)).assign_attrs(
@@ -691,8 +689,8 @@ def get_data_wind(coords, tmpdir=None, lock=None):
     )
 
 
-def get_data_influx(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["influx"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar influx")
+def get_data_influx(coords, tmpdir=None, lock=None, show_progress=False):
+    v = _fetch_vars(_FEATURE_VARS["influx"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar influx", show_progress=show_progress)
     ssrd, ssr, fdir, tisr = v["ssrd"], v["ssr"], v["fdir"], v["tisr"]
     albedo = ((ssrd - ssr) / ssrd.where(ssrd != 0)).fillna(0.0)
     influx_diffuse = ssrd - fdir
@@ -714,8 +712,8 @@ def get_data_influx(coords, tmpdir=None, lock=None):
     return xr.merge([ds, sp])
 
 
-def get_data_temperature(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["temperature"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar temperature")
+def get_data_temperature(coords, tmpdir=None, lock=None, show_progress=False):
+    v = _fetch_vars(_FEATURE_VARS["temperature"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar temperature", show_progress=show_progress)
     return xr.Dataset(
         {
             "temperature": v["t2m"].rename("temperature"),
@@ -725,13 +723,13 @@ def get_data_temperature(coords, tmpdir=None, lock=None):
     )
 
 
-def get_data_runoff(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["runoff"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar runoff")
+def get_data_runoff(coords, tmpdir=None, lock=None, show_progress=False):
+    v = _fetch_vars(_FEATURE_VARS["runoff"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar runoff", show_progress=show_progress)
     return xr.Dataset({"runoff": v["ro"].rename("runoff")})
 
 
-def get_data_height(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["height"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar height")
+def get_data_height(coords, tmpdir=None, lock=None, show_progress=False):
+    v = _fetch_vars(_FEATURE_VARS["height"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar height", show_progress=show_progress)
     return xr.Dataset({"height": v["z"].rename("height")})
 
 
@@ -747,6 +745,7 @@ def get_data(cutout, feature, tmpdir=None, lock=None, **creation_parameters):
     """
     coords = cutout.coords
     sanitize = creation_parameters.get("sanitize", True)
+    show_progress = creation_parameters.pop("show_progress", False)
 
     func = globals().get(f"get_data_{feature}")
     sanitize_func = globals().get(f"sanitize_{feature}")
@@ -761,13 +760,13 @@ def get_data(cutout, feature, tmpdir=None, lock=None, **creation_parameters):
 
     if tmpdir is not None:
         # Normal workflow: atlite's prepare machinery manages tmpdir lifecycle.
-        ds = func(coords, tmpdir=tmpdir, lock=lock)
+        ds = func(coords, tmpdir=tmpdir, lock=lock, show_progress=show_progress)
     else:
         # Direct call with no tmpdir: use a TemporaryDirectory so temp files
         # are cleaned up automatically.  Data must be loaded eagerly since the
         # temp files are deleted when the context exits.
         with tempfile.TemporaryDirectory() as _tmpdir:
-            ds = func(coords, tmpdir=_tmpdir, lock=lock).load()
+            ds = func(coords, tmpdir=_tmpdir, lock=lock, show_progress=show_progress).load()
 
     if sanitize and sanitize_func is not None:
         ds = sanitize_func(ds)

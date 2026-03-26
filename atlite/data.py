@@ -32,6 +32,7 @@ def get_features(
     tmpdir=None,
     monthly_requests=False,
     concurrent_requests=False,
+    show_progress=False,
 ):
     """
     Load the feature data for a given module.
@@ -53,6 +54,7 @@ def get_features(
             lock=lock,
             monthly_requests=monthly_requests,
             concurrent_requests=concurrent_requests,
+            show_progress=show_progress,
             **parameters,
         )
         datasets.append(feature_data)
@@ -235,6 +237,7 @@ def cutout_prepare(
             data_format=data_format,
             monthly_requests=monthly_requests,
             concurrent_requests=concurrent_requests,
+            show_progress=show_progress,
         )
         prepared |= set(missing_features)
 

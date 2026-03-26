@@ -14,6 +14,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     stream=sys.stdout,
 )
+logging.getLogger("numexpr").setLevel(logging.WARNING)
 logger = logging.getLogger("profile_germany")
 
 TMPDIR = "./tmp2"
