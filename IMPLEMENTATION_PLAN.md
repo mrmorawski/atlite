@@ -20,6 +20,17 @@ raw temp files are opened lazily and the full dask graph is returned directly
 to `cutout_prepare`.  See [Consolidation Removal](#consolidation-removal)
 below for details and testing instructions.
 
+**Dependencies note:** `cfgrib` (needed by the `era5` module for GRIB decoding) requires the
+ecCodes C library.  In this environment it is not installed system-wide, but can be made available
+at runtime via `ecmwflibs` (a self-contained Python wheel that ships ecCodes):
+```bash
+uv run --with ecmwflibs cfgrib pytest ...
+```
+Do **not** add `ecmwflibs` to `pyproject.toml`; it is only needed for running the ERA5 reference
+tests locally.
+
+For direct downloads from CDS API, you also need to link to the .cdsapirc present in project root as env var.
+
 **Quick start for a future contributor:**
 
 ```python

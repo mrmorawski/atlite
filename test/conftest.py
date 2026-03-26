@@ -199,11 +199,16 @@ def cutout_sarah_weird_resolution(cutouts_path):
     return cutout
 
 
+NCAR_TMPDIR = Path(__file__).parent.parent / "tmp"
+
+
 def _prepare_era5_ncar_cutout(path, prepare_kwargs=None, **kwargs):
     cutout = Cutout(path=path, module="era5-ncar", bounds=BOUNDS, **kwargs)
     if not path.exists() and not THREDDS_AVAILABLE:
         pytest.skip("NCAR THREDDS not reachable and no cached cutout available")
-    cutout.prepare(**(prepare_kwargs or {}))
+    kw = {"tmpdir": str(NCAR_TMPDIR)}
+    kw.update(prepare_kwargs or {})
+    cutout.prepare(**kw)
     return cutout
 
 

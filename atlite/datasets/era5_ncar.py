@@ -475,9 +475,17 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None):
     is passed to ``xr.open_dataset`` to serialise HDF5/netCDF4 chunk reads,
     which are not thread-safe.
 
+    If ``tmpdir`` is None, a TemporaryDirectory is created internally and the
+    returned DataArrays are eagerly loaded before it is deleted.
+
     All temp files are cleaned up by ``maybe_remove_tmpdir`` after
     ``cutout_prepare`` finishes writing.
     """
+    if tmpdir is None:
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            assembled = _fetch_vars(short_names, coords, tmpdir=_tmpdir, lock=lock)
+            return {sn: da.load() for sn, da in assembled.items()}
+
     x0, y0, x1, y1 = _bbox(coords)
     months = _months(coords)
     t = pd.DatetimeIndex(coords["time"].values)
@@ -616,14 +624,20 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None):
     # dask operations — nothing is materialised here.
     # ------------------------------------------------------------------
     assembled = {}
-    open_kw = dict(chunks={"time": 720}, lock=lock)
+    # Note: we do NOT pass a custom lock here.  xarray uses NETCDF4_PYTHON_LOCK
+    # by default, which is the same global lock that Phase 1's to_netcdf() calls
+    # use.  Passing a session-specific lock would create a mismatch: Phase 1
+    # writes (using NETCDF4_PYTHON_LOCK) and Phase 2 reads (using our lock) would
+    # not synchronise, causing HDF5 crashes when a fast feature's Phase 2 overlaps
+    # with a slow feature's Phase 1 in concurrent dask delayed tasks.
+    open_kw = dict(chunks={"time": 720})
 
     for sn in short_names:
         product_dir = VAR_MAP[sn][0]
 
         if product_dir == "e5.oper.invariant":
             path = inv_futures[sn].result()
-            da = xr.open_dataset(path, lock=lock, chunks={})["data"]
+            da = xr.open_dataset(path, chunks={})["data"]
 
         elif product_dir == "e5.oper.an.sfc":
             parts = []
