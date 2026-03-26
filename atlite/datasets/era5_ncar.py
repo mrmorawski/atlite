@@ -41,13 +41,12 @@ import logging
 import os
 import tempfile
 import threading
-import time
+import traceback
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import traceback
-
 import requests.exceptions
+from tqdm import tqdm
 from tenacity import (
     before_sleep_log,
     retry,
@@ -64,6 +63,9 @@ from atlite.datasets.era5 import sanitize_influx, sanitize_runoff, sanitize_wind
 from atlite.pv.solar_position import SolarPosition
 
 logger = logging.getLogger(__name__)
+
+# Suppress pydap's per-request INFO chatter — it's our transport layer.
+logging.getLogger("pydap").setLevel(logging.WARNING)
 
 MAX_WORKERS = 8  # concurrent OPeNDAP requests
 
@@ -491,37 +493,6 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None):
     t = pd.DatetimeIndex(coords["time"].values)
 
     # ------------------------------------------------------------------
-    # File-level debug logging (written to tmpdir/era5_ncar.log).
-    # ------------------------------------------------------------------
-    # Attach a file handler once (first call); subsequent calls reuse it.
-    _already = any(
-        isinstance(h, logging.FileHandler) and getattr(h, "_era5_ncar_logfile", False)
-        for h in logger.handlers
-    )
-    if tmpdir is not None and not _already:
-        log_path = os.path.join(tmpdir, "era5_ncar.log")
-        file_handler = logging.FileHandler(log_path)
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(threadName)s %(levelname)s %(message)s")
-        )
-        file_handler._era5_ncar_logfile = True
-        logger.addHandler(file_handler)
-        # Lower the logger gate so DEBUG reaches the file handler.  Console
-        # handlers keep their own level filters, so this won't spam stdout.
-        if logger.level > logging.DEBUG:
-            logger.setLevel(logging.DEBUG)
-        logger.debug(
-            "era5-ncar: logfile %s, bbox=(%.3f,%.3f,%.3f,%.3f), months=%s",
-            log_path,
-            x0,
-            y0,
-            x1,
-            y1,
-            months,
-        )
-
-    # ------------------------------------------------------------------
     # Phase 1: Submit all download tasks in parallel.
     # ------------------------------------------------------------------
     # Invariant/analysis futures: keyed by (sn,) or (sn, year, month).
@@ -580,35 +551,31 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None):
                         all_futures[f] = f"{sn} {year}-{month:02d}"
 
     logger.info(
-        "era5-ncar: submitting %d download tasks for [%s] with %d workers",
+        "era5-ncar: downloading %d files for [%s]",
         len(all_futures),
         ", ".join(short_names),
-        MAX_WORKERS,
     )
-    t_start = time.time()
 
+    show_bar = logger.isEnabledFor(logging.INFO)
     try:
-        for n_done, future in enumerate(as_completed(all_futures), 1):
-            try:
-                future.result()
-            except Exception:
-                label = all_futures[future]
-                logger.error(
-                    "era5-ncar: FAILED %s after retries:\n%s",
-                    label,
-                    traceback.format_exc(),
-                )
-                raise
-            elapsed = time.time() - t_start
-            eta = (elapsed / n_done) * (len(all_futures) - n_done)
-            logger.info(
-                "era5-ncar: [%d/%d] %s  (%.0fs elapsed, ETA %.0fs)",
-                n_done,
-                len(all_futures),
-                all_futures[future],
-                elapsed,
-                eta,
-            )
+        with tqdm(
+            as_completed(all_futures),
+            total=len(all_futures),
+            disable=not show_bar,
+            unit="file",
+            desc="era5-ncar download",
+        ) as bar:
+            for future in bar:
+                try:
+                    future.result()
+                except Exception:
+                    logger.error(
+                        "era5-ncar: FAILED %s after retries:\n%s",
+                        all_futures[future],
+                        traceback.format_exc(),
+                    )
+                    raise
+                logger.debug("era5-ncar: done %s", all_futures[future])
     except BaseException:
         for f in all_futures:
             f.cancel()

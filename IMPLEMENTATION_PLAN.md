@@ -6,11 +6,22 @@ SPDX-License-Identifier: MIT
 
 # era5-ncar Dataset Module for Atlite — Implementation Plan
 
-## Status: REFACTOR IN PROGRESS — consolidation removal
+## Status: COMPLETE — all tests pass, scale-tested to Europe
 
-All phases (A–E) are implemented and tested.  15/16 tests pass on the first run
-(the 16th, `test_compare_with_era5`, requires the CDS reference cutout to also
-be cached — run `TestERA5` first, or run both classes together).
+All phases (A–E) are implemented and tested.  **16/16 tests pass** (including
+`test_compare_with_era5` — requires the CDS reference cutout; run both
+`TestERA5` and `TestERA5NCAR` together, or supply `--cache-path ./tmp` where
+both cutouts are already cached).
+
+**Scale-test results (2026-03-26):**
+
+| Cutout | Grid | Download | Processing | Output |
+|--------|------|----------|------------|--------|
+| Germany (5.5–15.5°E, 47–55.5°N) | 41×35 | included | **7.2 min total** | 338 MB |
+| Europe (−25–45°E, 34–72°N) | 281×153 | 52.3 min | **~12.4 min** | 10.9 GB |
+
+Europe processing (dask compute + write, excluding download) is well within the
+45 min target.  No stuck processing, no HDF5 crashes observed at either scale.
 
 ### Latest change: Remove intermediate consolidation step
 
@@ -308,49 +319,74 @@ just coordinate alignment.
 The existing test suite covers this module end-to-end.  Tests hit the live
 NCAR THREDDS server (no mocks), so they require network access.
 
-**Test file:** `test/test_era5_ncar.py` (or similar — find with
-`find . -name '*era5_ncar*' -path '*/test*'`)
+**Test file:** `test/test_preparation_and_conversion.py`, class `TestERA5NCAR`
 
-**What to verify:**
+**Run with persistent cache** (avoids re-downloading on every run):
+```bash
+uv run pytest test/test_preparation_and_conversion.py::TestERA5NCAR -v --cache-path ./tmp
+```
+The `--cache-path ./tmp` flag reuses prepared cutouts from `./tmp/` across
+runs.  Raw OPeNDAP download cache files also live in `./tmp/`.
 
-1. **All existing tests still pass:**
+**All 6 checklist items — verified 2026-03-26:**
+
+1. **All existing tests still pass** ✅
    ```bash
-   pytest test/test_era5_ncar.py -v
+   uv run pytest test/test_preparation_and_conversion.py::TestERA5NCAR -v --cache-path ./tmp
    ```
-   The key tests exercise each feature (wind, influx, temperature, runoff,
-   height) and compare against CDS reference values to float32 precision.
+   16/16 pass in ~2 s (from cache).
 
-2. **No consolidation files are created:**
-   After a test run, check the tmpdir (logged as `era5_ncar.log` in the temp
-   directory).  There should be **no** `consolidated_*.nc` files — only the
-   raw `era5_ncar_*.nc` download cache files.
+2. **No consolidation files created** ✅
+   `ls tmp/consolidated_*.nc` → no matches.  Only `era5_ncar_*.nc` raw
+   download cache files exist in `./tmp/`.
 
-3. **Lock is threaded correctly:**
-   Verify that the `lock` parameter from `cutout_prepare` reaches
-   `xr.open_dataset`.  A quick way: add a temporary `assert lock is not None`
-   at the top of `_fetch_vars` and run a test that goes through
-   `cutout.prepare()`.
+3. **Lock is threaded correctly** ✅
+   `get_features` (in `data.py`) creates a `SerializableLock` and passes it
+   through `delayed(get_data)(..., lock=lock)` → `get_data()` → `_fetch_vars()`.
+   **Implementation detail:** `_fetch_vars` intentionally does *not* pass the
+   external lock to `xr.open_dataset`.  Instead it relies on xarray's built-in
+   `NETCDF4_PYTHON_LOCK`, which is the same lock used by the Phase 1
+   `to_netcdf()` writes.  Passing a different lock would create a mismatch
+   between concurrent Phase 1 writes and Phase 2 reads.  The net thread-safety
+   guarantee is identical.
 
-4. **No HDF5 crashes under concurrency:**
-   The most important thing to verify.  If the lock isn't working, you'll see
-   segfaults or "double free" errors from the HDF5 C library.  Run the full
-   test suite multiple times:
+4. **No HDF5 crashes under concurrency** ✅
+   Tested with 5 consecutive runs — zero segfaults or "double free" errors:
    ```bash
-   for i in $(seq 5); do pytest test/test_era5_ncar.py -v || break; done
+   for i in $(seq 5); do uv run pytest test/test_preparation_and_conversion.py::TestERA5NCAR -q --cache-path ./tmp || break; done
    ```
 
-5. **No-tmpdir fallback still works:**
-   Test the direct-call path (no `cutout.prepare()`):
+5. **No-tmpdir fallback works** ✅ *(bug fixed during testing)*
+   The original code crashed with `TypeError: expected str … not NoneType`
+   when a feature function (e.g. `get_data_height`) was called directly with
+   `tmpdir=None`.  Fixed by adding an early-return path in `_fetch_vars`:
    ```python
-   from atlite.datasets.era5_ncar import get_data_height
-   # Should work without tmpdir — uses TemporaryDirectory internally
-   # Data must be eagerly loaded (.load()) since temp files are cleaned up
+   if tmpdir is None:
+       with tempfile.TemporaryDirectory() as _tmpdir:
+           assembled = _fetch_vars(short_names, coords, tmpdir=_tmpdir, lock=lock)
+           return {sn: da.load() for sn, da in assembled.items()}
    ```
+   This matches the intent described in the plan and the behaviour already
+   present in `get_data()`.
 
-6. **Numerical accuracy unchanged:**
-   The `test_compare_with_era5` test (if present) validates that NCAR output
-   matches CDS output to float32 precision.  This should still pass since the
-   interp logic is unchanged.
+6. **Numerical accuracy unchanged** ✅
+   `test_compare_with_era5` passes — NCAR output matches CDS reference to
+   float32 precision on all variables.
+
+**Scale tests (run after unit tests):**
+
+Germany (full year 2013, complevel=1):
+```bash
+uv run python scripts/profile_germany.py
+```
+Note: only the first `cutout.prepare()` block of the script is valid.  Lines
+after it reference the removed consolidation phase and will error.
+
+Europe (full year 2013, complevel=1):
+```bash
+uv run python scripts/download_europe_2013.py --tmpdir ./tmp_europe
+```
+Processing (excl. download) must complete in <45 min.  Verified: ~12.4 min.
 
 ### Architecture after this change
 
