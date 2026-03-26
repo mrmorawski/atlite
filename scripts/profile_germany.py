@@ -48,6 +48,7 @@ def main():
         features=ALL_FEATURES,
         tmpdir=TMPDIR,
         compression={"zlib": True, "complevel": 1, "shuffle": True},
+        show_progress=True,
     )
     elapsed = time.time() - t0
 

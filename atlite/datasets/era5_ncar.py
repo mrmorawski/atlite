@@ -47,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests.exceptions
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 from tenacity import (
     before_sleep_log,
     retry,
@@ -299,11 +300,16 @@ def _fc_to_hourly(subset, ncar_varname):
     n_init, n_hour = len(init_times), len(hours_td)
     flat = vals.reshape(n_init * n_hour, *vals.shape[2:])
 
+    # Adjacent forecast initializations overlap in time (e.g. init at 00:00 with
+    # 18 forecast hours covers the same timestamps as init at 06:00).  Keep the
+    # first occurrence of each timestamp (shortest lead time -> lowest index).
+    _, idx = np.unique(actual_times, return_index=True)
+
     return xr.DataArray(
-        flat,
+        flat[idx],
         dims=["time", "latitude", "longitude"],
         coords={
-            "time": actual_times,
+            "time": actual_times[idx],
             "latitude": subset["latitude"].values,
             "longitude": subset["longitude"].values,
         },
@@ -459,7 +465,7 @@ def _bbox(coords):
     )
 
 
-def _fetch_vars(short_names, coords, tmpdir=None, lock=None):
+def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar"):
     """Fetch variables with parallel downloads, return lazy dask DataArrays.
 
     Architecture:
@@ -485,7 +491,7 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None):
     """
     if tmpdir is None:
         with tempfile.TemporaryDirectory() as _tmpdir:
-            assembled = _fetch_vars(short_names, coords, tmpdir=_tmpdir, lock=lock)
+            assembled = _fetch_vars(short_names, coords, tmpdir=_tmpdir, lock=lock, desc=desc)
             return {sn: da.load() for sn, da in assembled.items()}
 
     x0, y0, x1, y1 = _bbox(coords)
@@ -550,32 +556,27 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None):
                         fc_futures[url] = f
                         all_futures[f] = f"{sn} {year}-{month:02d}"
 
-    logger.info(
-        "era5-ncar: downloading %d files for [%s]",
-        len(all_futures),
-        ", ".join(short_names),
-    )
-
     show_bar = logger.isEnabledFor(logging.INFO)
     try:
-        with tqdm(
-            as_completed(all_futures),
-            total=len(all_futures),
-            disable=not show_bar,
-            unit="file",
-            desc="era5-ncar download",
-        ) as bar:
-            for future in bar:
-                try:
-                    future.result()
-                except Exception:
-                    logger.error(
-                        "era5-ncar: FAILED %s after retries:\n%s",
-                        all_futures[future],
-                        traceback.format_exc(),
-                    )
-                    raise
-                logger.debug("era5-ncar: done %s", all_futures[future])
+        with logging_redirect_tqdm():
+            with tqdm(
+                as_completed(all_futures),
+                total=len(all_futures),
+                disable=not show_bar,
+                unit="file",
+                desc=desc,
+            ) as bar:
+                for future in bar:
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.error(
+                            "era5-ncar: FAILED %s after retries:\n%s",
+                            all_futures[future],
+                            traceback.format_exc(),
+                        )
+                        raise
+                    logger.debug("era5-ncar: done %s", all_futures[future])
     except BaseException:
         for f in all_futures:
             f.cancel()
@@ -671,7 +672,7 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None):
 
 
 def get_data_wind(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["wind"], coords, tmpdir=tmpdir, lock=lock)
+    v = _fetch_vars(_FEATURE_VARS["wind"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar wind")
     wnd10m = np.sqrt(v["u10"] ** 2 + v["v10"] ** 2)
     wnd100m = np.sqrt(v["u100"] ** 2 + v["v100"] ** 2)
     wnd_shear_exp = (np.log(wnd10m / wnd100m) / np.log(10.0 / 100.0)).assign_attrs(
@@ -691,7 +692,7 @@ def get_data_wind(coords, tmpdir=None, lock=None):
 
 
 def get_data_influx(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["influx"], coords, tmpdir=tmpdir, lock=lock)
+    v = _fetch_vars(_FEATURE_VARS["influx"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar influx")
     ssrd, ssr, fdir, tisr = v["ssrd"], v["ssr"], v["fdir"], v["tisr"]
     albedo = ((ssrd - ssr) / ssrd.where(ssrd != 0)).fillna(0.0)
     influx_diffuse = ssrd - fdir
@@ -714,7 +715,7 @@ def get_data_influx(coords, tmpdir=None, lock=None):
 
 
 def get_data_temperature(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["temperature"], coords, tmpdir=tmpdir, lock=lock)
+    v = _fetch_vars(_FEATURE_VARS["temperature"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar temperature")
     return xr.Dataset(
         {
             "temperature": v["t2m"].rename("temperature"),
@@ -725,12 +726,12 @@ def get_data_temperature(coords, tmpdir=None, lock=None):
 
 
 def get_data_runoff(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["runoff"], coords, tmpdir=tmpdir, lock=lock)
+    v = _fetch_vars(_FEATURE_VARS["runoff"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar runoff")
     return xr.Dataset({"runoff": v["ro"].rename("runoff")})
 
 
 def get_data_height(coords, tmpdir=None, lock=None):
-    v = _fetch_vars(_FEATURE_VARS["height"], coords, tmpdir=tmpdir, lock=lock)
+    v = _fetch_vars(_FEATURE_VARS["height"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar height")
     return xr.Dataset({"height": v["z"].rename("height")})
 
 
