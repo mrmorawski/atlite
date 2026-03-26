@@ -70,7 +70,6 @@ MAX_WORKERS = 8  # concurrent OPeNDAP requests
 # Module-level pool caps total concurrent THREDDS connections across all
 # features that dask runs in parallel.  Threads are created on demand.
 _pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-_nc_write_lock = threading.Lock()
 
 # Thread-local requests.Session for HTTP keep-alive reuse.
 _thread_local = threading.local()
@@ -166,11 +165,6 @@ _FC_DIVIDE_BY_3600 = {"ssrd", "ssr", "fdir", "tisr"}
 # Extra degrees added to each side of the bbox when fetching native-resolution
 # data, so bilinear interpolation has support even at the target grid edges.
 _BBOX_PAD = 0.5
-
-# Chunk size (hours) for consolidated files.  Larger chunks reduce dask graph
-# overhead and improve compression ratio in the final cutout write.  720 h
-# ≈ 30 days, giving ~12 chunks per year instead of ~365.
-_CONSOLIDATED_CHUNKS = {"time": 720}
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +358,19 @@ def _retrieve_var(short_name, x0, y0, x1, y1, tmpdir, year=None, month=None, url
 
     product_dir, param_code, ncar_var = VAR_MAP[short_name]
     _retrieve_var_inner(
-        short_name, x0, y0, x1, y1, tmpdir, path, product_dir, param_code, ncar_var,
-        year=year, month=month, url=url,
+        short_name,
+        x0,
+        y0,
+        x1,
+        y1,
+        tmpdir,
+        path,
+        product_dir,
+        param_code,
+        ncar_var,
+        year=year,
+        month=month,
+        url=url,
     )
     return path
 
@@ -373,19 +378,31 @@ def _retrieve_var(short_name, x0, y0, x1, y1, tmpdir, year=None, month=None, url
 @retry(
     wait=wait_random_exponential(multiplier=1, min=2, max=120),
     stop=stop_after_attempt(8),
-    retry=retry_if_exception_type(
-        (requests.exceptions.RequestException, OSError)
-    ),
+    retry=retry_if_exception_type((requests.exceptions.RequestException, OSError)),
     before_sleep=before_sleep_log(logger, logging.WARNING),
 )
 def _retrieve_var_inner(
-    short_name, x0, y0, x1, y1, tmpdir, path, product_dir, param_code, ncar_var,
-    year=None, month=None, url=None,
+    short_name,
+    x0,
+    y0,
+    x1,
+    y1,
+    tmpdir,
+    path,
+    product_dir,
+    param_code,
+    ncar_var,
+    year=None,
+    month=None,
+    url=None,
 ):
     """Download + write, with retries. Called by _retrieve_var after cache check."""
     logger.debug(
         "era5-ncar: fetching %s year=%s month=%s url=%s",
-        short_name, year, month, url,
+        short_name,
+        year,
+        month,
+        url,
     )
 
     if product_dir == "e5.oper.invariant":
@@ -440,28 +457,26 @@ def _bbox(coords):
     )
 
 
-def _fetch_vars(short_names, coords, tmpdir=None):
-    """Fetch variables with parallel downloads, then consolidate to target grid.
+def _fetch_vars(short_names, coords, tmpdir=None, lock=None):
+    """Fetch variables with parallel downloads, return lazy dask DataArrays.
 
     Architecture:
       1. **Download** — all variables' tasks submitted to the module-level
          thread pool in parallel (I/O bound, full concurrency).  Each task
          writes a raw temp file at native resolution, cached by deterministic
          filename so interrupted runs are resumable.
-      2. **Assemble & consolidate** — for each variable, open raw temp files
-         lazily, concat months, interpolate/sel to target grid, then eagerly
-         compute and write one consolidated NetCDF per variable at target
-         resolution.  This collapses ~222 raw files into ~13 consolidated
-         files, giving ``cutout_prepare`` a simple dask graph for its final
-         write.
-      3. **Return** — lazy dask-backed DataArrays backed by consolidated
-         files.  Peak RAM ≈ one dask chunk (24 hours × target grid) at a time.
+      2. **Assemble** — for each variable, open raw temp files lazily with
+         dask, concat months, select target times, and interpolate/sel to
+         the target grid.  All operations stay lazy.
+      3. **Return** — lazy dask-backed DataArrays on the cutout's
+         (time, y, x) grid (or (y, x) for invariant height).
 
-    All temp files (raw + consolidated) are cleaned up by
-    ``maybe_remove_tmpdir`` after ``cutout_prepare`` finishes writing.
+    The ``lock`` parameter (typically a ``dask.utils.SerializableLock``)
+    is passed to ``xr.open_dataset`` to serialise HDF5/netCDF4 chunk reads,
+    which are not thread-safe.
 
-    Returns a dict mapping short_name → lazy DataArray on the cutout's
-    (time, y, x) grid (or (y, x) for invariant height).
+    All temp files are cleaned up by ``maybe_remove_tmpdir`` after
+    ``cutout_prepare`` finishes writing.
     """
     x0, y0, x1, y1 = _bbox(coords)
     months = _months(coords)
@@ -472,8 +487,7 @@ def _fetch_vars(short_names, coords, tmpdir=None):
     # ------------------------------------------------------------------
     # Attach a file handler once (first call); subsequent calls reuse it.
     _already = any(
-        isinstance(h, logging.FileHandler)
-        and getattr(h, "_era5_ncar_logfile", False)
+        isinstance(h, logging.FileHandler) and getattr(h, "_era5_ncar_logfile", False)
         for h in logger.handlers
     )
     if tmpdir is not None and not _already:
@@ -489,8 +503,15 @@ def _fetch_vars(short_names, coords, tmpdir=None):
         # handlers keep their own level filters, so this won't spam stdout.
         if logger.level > logging.DEBUG:
             logger.setLevel(logging.DEBUG)
-        logger.debug("era5-ncar: logfile %s, bbox=(%.3f,%.3f,%.3f,%.3f), months=%s",
-                      log_path, x0, y0, x1, y1, months)
+        logger.debug(
+            "era5-ncar: logfile %s, bbox=(%.3f,%.3f,%.3f,%.3f), months=%s",
+            log_path,
+            x0,
+            y0,
+            x1,
+            y1,
+            months,
+        )
 
     # ------------------------------------------------------------------
     # Phase 1: Submit all download tasks in parallel.
@@ -498,11 +519,11 @@ def _fetch_vars(short_names, coords, tmpdir=None):
     # Invariant/analysis futures: keyed by (sn,) or (sn, year, month).
     # Forecast futures: keyed by URL for deduplication (prev-half of
     # month N+1 == second-half of month N).
-    inv_futures = {}   # sn → Future
-    an_futures = {}    # (sn, year, month) → Future
-    fc_futures = {}    # url → Future
-    fc_urls = {}       # (sn, year, month) → [url, ...]
-    all_futures = {}   # Future → label (for progress logging)
+    inv_futures = {}  # sn → Future
+    an_futures = {}  # (sn, year, month) → Future
+    fc_futures = {}  # url → Future
+    fc_urls = {}  # (sn, year, month) → [url, ...]
+    all_futures = {}  # Future → label (for progress logging)
 
     for sn in short_names:
         product_dir, param_code, ncar_var = VAR_MAP[sn]
@@ -515,8 +536,15 @@ def _fetch_vars(short_names, coords, tmpdir=None):
         elif product_dir == "e5.oper.an.sfc":
             for year, month in months:
                 f = _pool.submit(
-                    _retrieve_var, sn, x0, y0, x1, y1, tmpdir,
-                    year=year, month=month,
+                    _retrieve_var,
+                    sn,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    tmpdir,
+                    year=year,
+                    month=month,
                 )
                 an_futures[(sn, year, month)] = f
                 all_futures[f] = f"{sn} {year}-{month:02d}"
@@ -531,7 +559,13 @@ def _fetch_vars(short_names, coords, tmpdir=None):
                 for url in urls:
                     if url not in fc_futures:
                         f = _pool.submit(
-                            _retrieve_var, sn, x0, y0, x1, y1, tmpdir,
+                            _retrieve_var,
+                            sn,
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            tmpdir,
                             url=url,
                         )
                         fc_futures[url] = f
@@ -539,7 +573,9 @@ def _fetch_vars(short_names, coords, tmpdir=None):
 
     logger.info(
         "era5-ncar: submitting %d download tasks for [%s] with %d workers",
-        len(all_futures), ", ".join(short_names), MAX_WORKERS,
+        len(all_futures),
+        ", ".join(short_names),
+        MAX_WORKERS,
     )
     t_start = time.time()
 
@@ -551,14 +587,19 @@ def _fetch_vars(short_names, coords, tmpdir=None):
                 label = all_futures[future]
                 logger.error(
                     "era5-ncar: FAILED %s after retries:\n%s",
-                    label, traceback.format_exc(),
+                    label,
+                    traceback.format_exc(),
                 )
                 raise
             elapsed = time.time() - t_start
             eta = (elapsed / n_done) * (len(all_futures) - n_done)
             logger.info(
                 "era5-ncar: [%d/%d] %s  (%.0fs elapsed, ETA %.0fs)",
-                n_done, len(all_futures), all_futures[future], elapsed, eta,
+                n_done,
+                len(all_futures),
+                all_futures[future],
+                elapsed,
+                eta,
             )
     except BaseException:
         for f in all_futures:
@@ -566,118 +607,79 @@ def _fetch_vars(short_names, coords, tmpdir=None):
         raise
 
     # ------------------------------------------------------------------
-    # Phase 2: Consolidate per-variable — merge many small temp files into
-    # one file per variable.  This collapses ~222 dask graph nodes into ~13,
-    # matching the simplicity of the ERA5/CDS pipeline and dramatically
-    # speeding up the final to_netcdf() write in cutout_prepare.
+    # Phase 2: Assemble lazy dask graph per variable.
     #
-    # The consolidation writes uncompressed at target resolution.  Raw
-    # temp files cover a padded bbox and span full months; consolidated
-    # files are trimmed to the exact cutout grid and time range.  The
-    # trade-off is extra I/O now in exchange for a simple, fast final write.
+    # Each raw temp file is opened lazily via xr.open_dataset with the
+    # caller's lock (serialises HDF5 chunk reads, which are not
+    # thread-safe).  Time selection, unit conversion, coordinate
+    # renaming, and spatial interpolation are all deferred as lazy
+    # dask operations — nothing is materialised here.
     # ------------------------------------------------------------------
     assembled = {}
+    open_kw = dict(chunks={"time": 720}, lock=lock)
 
-    # The entire consolidation phase must be serialized because the netCDF4/HDF5
-    # C library is not thread-safe — concurrent open_dataset() calls from
-    # multiple dask threads cause "double free" crashes.  Downloads (Phase 1)
-    # remain fully parallel since they use pydap (pure Python, thread-safe).
-    with _nc_write_lock:
-        for sn in short_names:
-            # Check consolidated cache first (before opening raw files).
-            consolidated_path = os.path.join(tmpdir, f"consolidated_{sn}.nc")
-            if os.path.exists(consolidated_path) and os.path.getsize(consolidated_path) > 0:
-                logger.info("era5-ncar: consolidated cache hit for %s", sn)
-                da_out = xr.open_dataset(consolidated_path, chunks=_CONSOLIDATED_CHUNKS)["data"]
-                da_out.encoding.clear()
-                assembled[sn] = da_out
-                continue
+    for sn in short_names:
+        product_dir = VAR_MAP[sn][0]
 
-            product_dir = VAR_MAP[sn][0]
-            raw_datasets = []  # track for cleanup
+        if product_dir == "e5.oper.invariant":
+            path = inv_futures[sn].result()
+            da = xr.open_dataset(path, lock=lock, chunks={})["data"]
 
-            if product_dir == "e5.oper.invariant":
-                path = inv_futures[sn].result()
-                raw_ds = xr.open_dataset(path, chunks={})
-                raw_datasets.append(raw_ds)
-                da = raw_ds["data"]
+        elif product_dir == "e5.oper.an.sfc":
+            parts = []
+            for year, month in months:
+                path = an_futures[(sn, year, month)].result()
+                chunk = xr.open_dataset(path, **open_kw)["data"]
+                mt = t[(t.year == year) & (t.month == month)]
+                if len(mt):
+                    parts.append(
+                        chunk.sel(
+                            time=mt,
+                            method="nearest",
+                            tolerance=pd.Timedelta("30min"),
+                        ).assign_coords(time=mt.values)
+                    )
+            da = xr.concat(parts, dim="time")
 
-            elif product_dir == "e5.oper.an.sfc":
-                parts = []
-                for year, month in months:
-                    path = an_futures[(sn, year, month)].result()
-                    raw_ds = xr.open_dataset(path, chunks={"time": 24})
-                    raw_datasets.append(raw_ds)
-                    chunk = raw_ds["data"]
-                    mt = t[(t.year == year) & (t.month == month)]
-                    if len(mt):
-                        parts.append(
-                            chunk.sel(
-                                time=mt, method="nearest", tolerance=pd.Timedelta("30min")
-                            ).assign_coords(time=mt.values)
-                        )
-                da = xr.concat(parts, dim="time")
+        else:
+            # fc.sfc.accumu
+            month_parts = []
+            for year, month in months:
+                paths = [
+                    fc_futures[url].result() for url in fc_urls[(sn, year, month)]
+                ]
+                halves = []
+                for p in paths:
+                    halves.append(xr.open_dataset(p, **open_kw)["data"])
+                hourly = xr.concat(halves, dim="time")
+                _, idx = np.unique(hourly.time.values, return_index=True)
+                hourly = hourly.isel(time=idx)
+                if sn in _FC_DIVIDE_BY_3600:
+                    hourly = hourly / 3600.0
+                hourly = _to_xy(hourly)
+                mt = t[(t.year == year) & (t.month == month)]
+                if len(mt):
+                    month_parts.append(
+                        hourly.sel(
+                            time=mt,
+                            method="nearest",
+                            tolerance=pd.Timedelta("30min"),
+                        ).assign_coords(time=mt.values)
+                    )
+            da = xr.concat(month_parts, dim="time")
 
-            else:
-                # fc.sfc.accumu
-                month_parts = []
-                for year, month in months:
-                    paths = [fc_futures[url].result() for url in fc_urls[(sn, year, month)]]
-                    chunks = []
-                    for p in paths:
-                        raw_ds = xr.open_dataset(p, chunks={"time": 24})
-                        raw_datasets.append(raw_ds)
-                        chunks.append(raw_ds["data"])
-                    hourly = xr.concat(chunks, dim="time")
-                    _, idx = np.unique(hourly.time.values, return_index=True)
-                    hourly = hourly.isel(time=idx)
-                    if sn in _FC_DIVIDE_BY_3600:
-                        hourly = hourly / 3600.0
-                    hourly = _to_xy(hourly)
-                    mt = t[(t.year == year) & (t.month == month)]
-                    if len(mt):
-                        month_parts.append(
-                            hourly.sel(
-                                time=mt, method="nearest", tolerance=pd.Timedelta("30min")
-                            ).assign_coords(time=mt.values)
-                        )
-                da = xr.concat(month_parts, dim="time")
-
-            # Interpolate to target grid.
-            ds_one = xr.Dataset({sn: da})
-            if _grids_align(ds_one, coords):
-                result = ds_one.sel(
-                    x=coords["x"].values, y=coords["y"].values, method="nearest"
-                )[sn]
-            else:
-                result = ds_one.interp(
-                    x=coords["x"].values, y=coords["y"].values, method="linear"
-                )[sn]
-            result.encoding.clear()
-
-            # Consolidate: eagerly compute this variable and write one clean
-            # uncompressed NetCDF at target resolution.  Explicit HDF5
-            # chunksizes match the dask chunks used when re-reading, avoiding
-            # a costly chunk-boundary mismatch during the final write.
-            logger.info("era5-ncar: consolidating %s to %s", sn, consolidated_path)
-            computed = result.compute(scheduler="synchronous")
-            to_write = xr.Dataset({"data": computed})
-            chunksizes = [min(_CONSOLIDATED_CHUNKS.get(d, s), s)
-                          for d, s in zip(computed.dims, computed.shape)]
-            for v in to_write.data_vars:
-                to_write[v].encoding.clear()
-                to_write[v].encoding["chunksizes"] = chunksizes
-            tmp_consolidated = consolidated_path + ".tmp"
-            to_write.to_netcdf(tmp_consolidated)
-
-            # Close raw temp file handles now that data is materialized.
-            for raw_ds in raw_datasets:
-                raw_ds.close()
-
-            os.rename(tmp_consolidated, consolidated_path)
-            da_out = xr.open_dataset(consolidated_path, chunks=_CONSOLIDATED_CHUNKS)["data"]
-            da_out.encoding.clear()
-            assembled[sn] = da_out
+        # Interpolate/select to target grid.
+        ds_one = xr.Dataset({sn: da})
+        if _grids_align(ds_one, coords):
+            result = ds_one.sel(
+                x=coords["x"].values, y=coords["y"].values, method="nearest"
+            )[sn]
+        else:
+            result = ds_one.interp(
+                x=coords["x"].values, y=coords["y"].values, method="linear"
+            )[sn]
+        result.encoding.clear()
+        assembled[sn] = result
 
     return assembled
 
@@ -687,8 +689,8 @@ def _fetch_vars(short_names, coords, tmpdir=None):
 # ---------------------------------------------------------------------------
 
 
-def get_data_wind(coords, tmpdir=None):
-    v = _fetch_vars(_FEATURE_VARS["wind"], coords, tmpdir=tmpdir)
+def get_data_wind(coords, tmpdir=None, lock=None):
+    v = _fetch_vars(_FEATURE_VARS["wind"], coords, tmpdir=tmpdir, lock=lock)
     wnd10m = np.sqrt(v["u10"] ** 2 + v["v10"] ** 2)
     wnd100m = np.sqrt(v["u100"] ** 2 + v["v100"] ** 2)
     wnd_shear_exp = (np.log(wnd10m / wnd100m) / np.log(10.0 / 100.0)).assign_attrs(
@@ -707,8 +709,8 @@ def get_data_wind(coords, tmpdir=None):
     )
 
 
-def get_data_influx(coords, tmpdir=None):
-    v = _fetch_vars(_FEATURE_VARS["influx"], coords, tmpdir=tmpdir)
+def get_data_influx(coords, tmpdir=None, lock=None):
+    v = _fetch_vars(_FEATURE_VARS["influx"], coords, tmpdir=tmpdir, lock=lock)
     ssrd, ssr, fdir, tisr = v["ssrd"], v["ssr"], v["fdir"], v["tisr"]
     albedo = ((ssrd - ssr) / ssrd.where(ssrd != 0)).fillna(0.0)
     influx_diffuse = ssrd - fdir
@@ -730,8 +732,8 @@ def get_data_influx(coords, tmpdir=None):
     return xr.merge([ds, sp])
 
 
-def get_data_temperature(coords, tmpdir=None):
-    v = _fetch_vars(_FEATURE_VARS["temperature"], coords, tmpdir=tmpdir)
+def get_data_temperature(coords, tmpdir=None, lock=None):
+    v = _fetch_vars(_FEATURE_VARS["temperature"], coords, tmpdir=tmpdir, lock=lock)
     return xr.Dataset(
         {
             "temperature": v["t2m"].rename("temperature"),
@@ -741,13 +743,13 @@ def get_data_temperature(coords, tmpdir=None):
     )
 
 
-def get_data_runoff(coords, tmpdir=None):
-    v = _fetch_vars(_FEATURE_VARS["runoff"], coords, tmpdir=tmpdir)
+def get_data_runoff(coords, tmpdir=None, lock=None):
+    v = _fetch_vars(_FEATURE_VARS["runoff"], coords, tmpdir=tmpdir, lock=lock)
     return xr.Dataset({"runoff": v["ro"].rename("runoff")})
 
 
-def get_data_height(coords, tmpdir=None):
-    v = _fetch_vars(_FEATURE_VARS["height"], coords, tmpdir=tmpdir)
+def get_data_height(coords, tmpdir=None, lock=None):
+    v = _fetch_vars(_FEATURE_VARS["height"], coords, tmpdir=tmpdir, lock=lock)
     return xr.Dataset({"height": v["z"].rename("height")})
 
 
@@ -777,13 +779,13 @@ def get_data(cutout, feature, tmpdir=None, lock=None, **creation_parameters):
 
     if tmpdir is not None:
         # Normal workflow: atlite's prepare machinery manages tmpdir lifecycle.
-        ds = func(coords, tmpdir=tmpdir)
+        ds = func(coords, tmpdir=tmpdir, lock=lock)
     else:
         # Direct call with no tmpdir: use a TemporaryDirectory so temp files
-        # are cleaned up automatically.  _fetch_vars already .load()s after
-        # interpolation, so ds is in-memory when the context exits.
+        # are cleaned up automatically.  Data must be loaded eagerly since the
+        # temp files are deleted when the context exits.
         with tempfile.TemporaryDirectory() as _tmpdir:
-            ds = func(coords, tmpdir=_tmpdir)
+            ds = func(coords, tmpdir=_tmpdir, lock=lock).load()
 
     if sanitize and sanitize_func is not None:
         ds = sanitize_func(ds)

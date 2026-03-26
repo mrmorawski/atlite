@@ -6,11 +6,19 @@ SPDX-License-Identifier: MIT
 
 # era5-ncar Dataset Module for Atlite — Implementation Plan
 
-## Status: COMPLETE
+## Status: REFACTOR IN PROGRESS — consolidation removal
 
 All phases (A–E) are implemented and tested.  15/16 tests pass on the first run
 (the 16th, `test_compare_with_era5`, requires the CDS reference cutout to also
 be cached — run `TestERA5` first, or run both classes together).
+
+### Latest change: Remove intermediate consolidation step
+
+The consolidation phase (Phase 2 of `_fetch_vars`) has been removed.  Instead
+of eagerly materialising each variable into an intermediate NetCDF file, the
+raw temp files are opened lazily and the full dask graph is returned directly
+to `cutout_prepare`.  See [Consolidation Removal](#consolidation-removal)
+below for details and testing instructions.
 
 **Quick start for a future contributor:**
 
@@ -205,366 +213,145 @@ All variables match to float32 precision or better (tested on BOUNDS=(−4, 56,
 
 ---
 
-## Implementation
+## Consolidation Removal
 
-### Files created/modified
+### Problem
 
-| File | Action |
-|------|--------|
-| `atlite/datasets/era5_ncar.py` | **Created**: new dataset module (~270 lines) |
-| `atlite/datasets/__init__.py` | Added import + registered as `"era5-ncar"` |
-| `test/conftest.py` | Added `THREDDS_AVAILABLE` probe + 2 fixtures |
-| `test/test_preparation_and_conversion.py` | Added `TestERA5NCAR` (16 tests) |
-| `scripts/dataset_comparison.py` | Exploration + verification script |
-| `atlite/datasets/era5.py` | **No changes** |
-| `pyproject.toml` | **No changes** |
+`_fetch_vars` had a two-phase architecture:
+1. **Download** — ~200+ raw files fetched from OPeNDAP in parallel (pydap,
+   thread-safe), written to temp NetCDF at native resolution.
+2. **Consolidate** — raw files opened with netCDF4/HDF5 (not thread-safe),
+   concatenated, interpolated to target grid, eagerly `.compute()`-ed, and
+   written as ~13 consolidated NetCDF files.  All under a module-level
+   `_nc_write_lock`, fully serialised.
 
-### Exploration script
+The consolidation then re-opened those files lazily for the final
+`cutout_prepare` write — an unnecessary round-trip through disk.
 
-`scripts/dataset_comparison.py` has four modes:
+### Why consolidation was there (and why it's no longer needed)
+
+The consolidation existed for two reasons:
+
+1. **HDF5 thread safety** — the netCDF4/HDF5 C library crashes on concurrent
+   reads from multiple dask threads.  The workaround was a global
+   `threading.Lock()` around the entire Phase 2.
+
+   **Solution**: xarray's `open_dataset` natively accepts a `lock` parameter
+   that serialises individual chunk reads.  The caller (`cutout_prepare` in
+   `data.py`) already creates a `dask.utils.SerializableLock()` and passes it
+   to `get_data()` — era5_ncar was simply ignoring it.
+
+2. **Dask graph complexity** — concern that ~200 nodes would be too many.
+
+   **Not a real issue**: dask routinely handles thousands of graph nodes.  The
+   overhead is negligible vs. I/O time.
+
+### What changed in `era5_ncar.py`
+
+**Removed:**
+- `_nc_write_lock` (`threading.Lock`) — replaced by xarray's per-chunk lock
+- `_CONSOLIDATED_CHUNKS` constant — no longer needed
+- Entire consolidation block (~80 lines): the eager `.compute()`, intermediate
+  NetCDF write/re-open cycle, and consolidated file caching
+
+**Added/Changed:**
+- `_fetch_vars(short_names, coords, tmpdir=None, lock=None)` — new `lock`
+  parameter, passed to every `xr.open_dataset(..., lock=lock)` call
+- `lock` threaded through: `get_data()` → `get_data_*()` → `_fetch_vars()`
+- Phase 2 is now purely lazy: open files → concat → time select → spatial
+  interp → return.  No materialisation.
+- `get_data()` no-tmpdir fallback path: added `.load()` since temp files are
+  deleted when the `TemporaryDirectory` context exits
+
+**Unchanged:**
+- Phase 1 (parallel OPeNDAP downloads) — identical
+- Spatial interpolation logic (`_grids_align` / `interp` / `sel`) — still
+  needed because OPeNDAP cannot do server-side regridding (unlike CDS which
+  accepts a `"grid"` parameter).  The standard `era5.py` module avoids interp
+  by requesting data at target resolution from CDS; era5_ncar downloads at
+  native 0.25° and interpolates client-side.
+- Raw file caching (deterministic filenames, resumable downloads)
+- Forecast dedup, unit conversion (`/3600`), `_to_xy` coordinate rename
+- `_retrieve_var` / `_retrieve_var_inner` download logic
+
+**Net diff:** ~80 lines removed, ~0 lines of new logic.
+
+### Why spatial interpolation stays
+
+`cutout_prepare()` (in `data.py`) calls `xr.merge(datasets, compat="equals")`
+after collecting results from all modules — it expects every module's
+`get_data()` to return data already on the target grid.  There is **no
+post-merge spatial alignment**.
+
+The standard `era5.py` avoids client-side interp by passing
+`"grid": f"{cutout.dx}/{cutout.dy}"` to the CDS API.  OPeNDAP has no
+equivalent — data always comes back at native 0.25° resolution.  So
+era5_ncar must interp to the target grid before returning.
+
+In the common case (cutout at 0.25°), `_grids_align` returns `True` and
+the code falls through to `sel(method="nearest")` — no actual interpolation,
+just coordinate alignment.
+
+### Testing instructions
+
+The existing test suite covers this module end-to-end.  Tests hit the live
+NCAR THREDDS server (no mocks), so they require network access.
+
+**Test file:** `test/test_era5_ncar.py` (or similar — find with
+`find . -name '*era5_ncar*' -path '*/test*'`)
+
+**What to verify:**
+
+1. **All existing tests still pass:**
+   ```bash
+   pytest test/test_era5_ncar.py -v
+   ```
+   The key tests exercise each feature (wind, influx, temperature, runoff,
+   height) and compare against CDS reference values to float32 precision.
+
+2. **No consolidation files are created:**
+   After a test run, check the tmpdir (logged as `era5_ncar.log` in the temp
+   directory).  There should be **no** `consolidated_*.nc` files — only the
+   raw `era5_ncar_*.nc` download cache files.
+
+3. **Lock is threaded correctly:**
+   Verify that the `lock` parameter from `cutout_prepare` reaches
+   `xr.open_dataset`.  A quick way: add a temporary `assert lock is not None`
+   at the top of `_fetch_vars` and run a test that goes through
+   `cutout.prepare()`.
+
+4. **No HDF5 crashes under concurrency:**
+   The most important thing to verify.  If the lock isn't working, you'll see
+   segfaults or "double free" errors from the HDF5 C library.  Run the full
+   test suite multiple times:
+   ```bash
+   for i in $(seq 5); do pytest test/test_era5_ncar.py -v || break; done
+   ```
+
+5. **No-tmpdir fallback still works:**
+   Test the direct-call path (no `cutout.prepare()`):
+   ```python
+   from atlite.datasets.era5_ncar import get_data_height
+   # Should work without tmpdir — uses TemporaryDirectory internally
+   # Data must be eagerly loaded (.load()) since temp files are cleaned up
+   ```
+
+6. **Numerical accuracy unchanged:**
+   The `test_compare_with_era5` test (if present) validates that NCAR output
+   matches CDS output to float32 precision.  This should still pass since the
+   interp logic is unchanged.
+
+### Architecture after this change
 
 ```
-python scripts/dataset_comparison.py            # Phase B: metadata exploration
-python scripts/dataset_comparison.py --phase-c  # Phase C: full feature comparison
-python scripts/dataset_comparison.py --phase-d  # Phase D: regridding test
-python scripts/dataset_comparison.py --influx   # influx section only (fast debug)
+cutout.prepare()
+  └─ get_features()                    # data.py — creates SerializableLock
+       └─ get_data(lock=lock)          # era5_ncar.py
+            └─ get_data_wind(lock=lock)
+                 └─ _fetch_vars(lock=lock)
+                      ├─ Phase 1: parallel OPeNDAP downloads → raw .nc files
+                      └─ Phase 2: open_dataset(lock=lock) → lazy dask graph
+  └─ ds.to_netcdf(compute=False)       # dask writes final cutout
+       └─ dask scheduler reads chunks through the lock (HDF5-safe)
 ```
 
-Requires internet access and `test-cache/cutout_era5.nc` (for phases C/D).
-
-### Module architecture (`atlite/datasets/era5_ncar.py`)
-
-Key internal functions:
-
-```
-_open_opendap(path)                    Opens OPeNDAP URL with pydap engine
-_sel_bbox(ds, x0, y0, x1, y1)         Spatial subset; handles 0-meridian wrap
-_to_xy(da)                             latitude/longitude → y/x; round coords
-_an_sfc_url(product_dir, param_code, year, month)
-_fc_half_urls(product_dir, param_code, year, month)   → [first_half, second_half]
-_fc_prev_half_url(product_dir, param_code, year, month)
-_fc_to_hourly(subset, ncar_varname)    Flatten (init, hour, lat, lon) → (time, lat, lon)
-_retrieve_var(short_name, year, month, x0, y0, x1, y1)
-                                       Unified fetch: dispatches to an.sfc / fc.sfc.accumu
-                                       / invariant path; inlines all download logic
-_fetch_vars(short_names, coords)       Submits all (var, month) tasks concurrently via
-                                       ThreadPoolExecutor; assembles + interpolates results
-_interp(da, coords)                    xr.interp to target x/y grid
-get_data_wind(coords)                  Pure assembler: calls _fetch_vars, computes derived
-get_data_influx(coords)                Pure assembler: calls _fetch_vars, computes derived
-get_data_temperature(coords)           Pure assembler: calls _fetch_vars, computes derived
-get_data_runoff(coords)                Pure assembler: calls _fetch_vars, computes derived
-get_data_height(coords)                Pure assembler: calls _fetch_vars, computes derived
-get_data(cutout, feature, ...)         Entry point; same signature as era5.get_data()
-```
-
-### Testing
-
-```bash
-# Run era5-ncar tests (downloads from NCAR, ~8 min for one day)
-python -m pytest test/test_preparation_and_conversion.py::TestERA5NCAR -v --cache-path=test-cache
-
-# Run comparison test (needs CDS cutout cached too)
-python -m pytest test/test_preparation_and_conversion.py::TestERA5 \
-                 test/test_preparation_and_conversion.py::TestERA5NCAR \
-                 -v --cache-path=test-cache
-```
-
----
-
-## Known issues and future work
-
-### Performance
-
-Concurrent downloads are implemented via `ThreadPoolExecutor` (default
-`MAX_WORKERS = 8`).  All `(short_name, year, month)` tasks for a feature are
-submitted to the pool simultaneously; results are assembled once all futures
-complete.  For a full year × all features this gives ~8× wall-time reduction
-over the previous sequential implementation.
-
-### THREDDS reliability
-
-THREDDS can be slow or return 500 errors under load.  The module has no retry
-logic.  Consider wrapping `_open_opendap()` with `tenacity` retries for
-production use.
-
-### `test_compare_with_era5` skip
-
-This test requires both `cutout_era5` (CDS) and `cutout_era5_ncar` to be
-cached.  If running `TestERA5NCAR` in isolation with `--cache-path`, the CDS
-fixture may not be available.  Run `TestERA5` first (or together) to populate
-the CDS cache.
-
-### GDEX Subset API as fallback
-
-If THREDDS becomes unreliable, GDEX (`https://gdex.ucar.edu/api/`) provides the
-same data with async queuing.  It requires a free ORCID-based auth token.  A
-GDEX backend could be added as `module="era5-ncar-gdex"` following the same
-module pattern.
-
----
-
-## Phase F — Code quality fixes
-
-Seven issues identified by code review, ordered by implementation dependency.
-Changes are confined to `atlite/datasets/era5_ncar.py` unless noted.
-
-### F1. Context managers for OPeNDAP datasets (high priority)
-
-**Problem:** `_open_opendap` returns a dataset that is later closed with an
-explicit `ds.close()`.  If anything between open and close raises, the
-connection/file-descriptor leaks.
-
-**Fix:** In `_retrieve_var`, wrap every `_open_opendap` call in a `with`
-statement.  `xr.Dataset` supports the context-manager protocol, so this is a
-drop-in change:
-
-```python
-# invariant branch
-with _open_opendap(_INVARIANT_PATH) as ds:
-    subset = _sel_bbox(ds, x0, y0, x1, y1)
-    z = subset["Z"].isel(time=0, drop=True).load()
-    return _to_xy(z / 9.80665)
-
-# an.sfc branch
-with _open_opendap(path) as ds:
-    subset = _sel_bbox(ds, x0, y0, x1, y1)
-    da = _to_xy(subset[ncar_var].load())
-    return da
-
-# fc.sfc.accumu branch
-for url in urls:
-    with _open_opendap(url) as ds:
-        subset = _sel_bbox(ds, x0, y0, x1, y1)
-        parts.append(_fc_to_hourly(subset, ncar_var))
-```
-
-Remove all bare `ds.close()` calls.
-
-### F2. Remove redundant sorts in forecast path (low priority, do alongside F1)
-
-**Problem:** `_fc_to_hourly` sorts by time (`.sortby("time")`), then
-`_retrieve_var` sorts the concatenated result again, then `np.unique`
-implicitly sorts a third time.
-
-**Fix:**
-- Remove `.sortby("time")` from the end of `_fc_to_hourly`.
-- Remove `.sortby("time")` from the `xr.concat` line in `_retrieve_var`.
-- The `np.unique` call already produces sorted indices; that alone is
-  sufficient.
-
-### F3. Add tolerance to `method="nearest"` time selection (medium priority)
-
-**Problem:** In `_fetch_vars`, `da.sel(time=mt, method="nearest")` silently
-snaps to the closest available timestamp if there's a mismatch.  At month
-boundaries this could mask off-by-one-hour bugs.
-
-**Fix:** Add `tolerance="30min"` to the `.sel()` call:
-
-```python
-sel = da.sel(time=mt, method="nearest", tolerance="30min")
-```
-
-This still handles float-precision rounding in timestamps but raises
-`KeyError` if a requested time is genuinely missing (> 30 min gap), making
-boundary bugs visible immediately.
-
-### F4. Reduce MAX_WORKERS and move retry to `_open_opendap` (medium priority)
-
-**Problem:** `MAX_WORKERS = 16` can overload THREDDS.  The `@retry` decorator
-is on `_retrieve_var`, so a failure on the 3rd forecast URL retries all 3 URLs
-from scratch.
-
-**Fix (two parts):**
-
-1. **Reduce `MAX_WORKERS` to 8** (matches the original plan value).
-
-2. **Move `@retry` from `_retrieve_var` to `_open_opendap`**, so each
-   individual OPeNDAP open is retried independently:
-
-```python
-@retry(
-    wait=wait_random_exponential(multiplier=1, min=2, max=60),
-    stop=stop_after_attempt(5),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-)
-def _open_opendap(path):
-    ...
-```
-
-Remove the `@retry` from `_retrieve_var`.  This means a transient 500 on one
-forecast half-file retries just that file, not the entire variable+month.
-
-### F5. Parallelize forecast half-file fetches (low priority)
-
-**Problem:** Each forecast `_retrieve_var` call opens 3 URLs serially
-(prev-half + 2 halves).  The thread pool parallelizes across `(var, month)`
-combinations, but within one combination there are 3 serial round-trips.
-
-**Fix:** Restructure so each forecast half-file is its own task submitted to
-the pool.  In `_fetch_vars`, expand the task list:
-
-```python
-for sn in short_names:
-    product_dir, param_code, ncar_var = VAR_MAP[sn]
-    if product_dir == "e5.oper.invariant":
-        tasks.append(("invariant", sn, None, None, None))
-    elif product_dir == "e5.oper.an.sfc":
-        for year, month in months:
-            tasks.append(("an_sfc", sn, year, month, None))
-    else:
-        for year, month in months:
-            urls = [
-                _fc_prev_half_url(product_dir, param_code, year, month),
-                *_fc_half_urls(product_dir, param_code, year, month),
-            ]
-            for url in urls:
-                tasks.append(("fc_half", sn, year, month, url))
-```
-
-Add a thin `_retrieve_fc_half(url, ncar_var, x0, y0, x1, y1)` that opens one
-URL and returns the hourly DataArray.  The assembly step in `_fetch_vars` then
-concatenates + deduplicates per `(sn, year, month)` as before.
-
-This replaces `_retrieve_var`'s forecast branch — the function becomes simpler
-(only handles invariant and an.sfc) or is split into three small helpers.
-
-### F6. Batch interpolation per feature (low priority)
-
-**Problem:** `_interp` is called once per variable.  Since all variables for a
-feature share the same source and target grids, xarray recomputes grid weights
-each time.
-
-**Fix:** In `_fetch_vars`, after assembling all per-variable DataArrays into a
-dict, combine them into a single `xr.Dataset` and call `.interp()` once:
-
-```python
-# Replace the per-variable _interp calls with:
-ds_raw = xr.Dataset({sn: da for sn, da in assembled_raw.items()})
-ds_interp = ds_raw.interp(x=coords["x"].values, y=coords["y"].values, method="linear")
-return {sn: ds_interp[sn] for sn in short_names}
-```
-
-Invariant (height) vars have no time dim, so handle them separately — either
-interpolate them first, or split the dataset into time-varying and static
-groups.
-
-### F7. Lazy loading with dask instead of eager `.load()` (high priority)
-
-**Problem:** Every variable is `.load()`ed into memory at native 0.25°
-resolution inside `_retrieve_var`.  For a full-year, continent-scale cutout
-with all features, this can exhaust RAM.  The era5 module uses dask lazy
-arrays and chunked disk I/O.
-
-**Fix:** This is the largest change and should be done last since it touches
-the data flow throughout the module.
-
-1. **Remove `.load()` calls** in `_retrieve_var`.  Let data remain lazy
-   (pydap-backed).
-
-2. **Problem:** pydap datasets cannot be used across threads (the HTTP session
-   is not thread-safe for lazy access).  Two options:
-   - **(a) Keep threads, load to disk:** Each thread downloads its chunk to a
-     temporary NetCDF file (using `da.to_netcdf(tmpfile)`), then re-opens it
-     lazily with `xr.open_dataarray(tmpfile, chunks={})`.  This mirrors the
-     era5 module's pattern (download → tmp file → lazy open).
-   - **(b) Sequential lazy open:** Drop threading, open all pydap URLs
-     sequentially (metadata only), let xarray/dask handle the parallel
-     compute when data is actually needed.  Simpler but loses the download
-     parallelism.
-
-   Option (a) is recommended — it preserves the existing download parallelism
-   while keeping memory bounded.
-
-3. **Accept `tmpdir` in `get_data`:** The `tmpdir` parameter (already in the
-   function signature but currently unused) becomes the location for
-   intermediate files.  If `None`, fall back to `tempfile.mkdtemp()`.
-
-4. **Wire up dask chunks:** After re-opening from disk, ensure DataArrays
-   have chunks (e.g. `chunks={"time": 24}`) so downstream operations remain
-   lazy.
-
-5. **Test with large cutout:** Verify memory stays bounded for a full-year
-   European cutout.  Compare numerical output against the eager implementation
-   to ensure no regressions.
-
-**Note:** This can be deferred if the module is only used for small/medium
-cutouts in the near term.  The other fixes (F1–F6) are all independent of
-this one.
-
-### F8. Subset prev-half forecast files before loading (high priority)
-
-**Problem:** Each forecast variable-month fetches the *full* previous
-half-month file (~15 days of data at ~65 MB for Europe) just to use ~6 hours
-that spill into the target month.  `_fc_to_hourly` calls `.load()` on the
-entire spatially-subsetted file without first subsetting on
-`forecast_initial_time`.
-
-For a full-year European cutout this adds ~3.8 GB of unnecessary downloads
-(5 fc vars × 12 months × ~63 MB wasted per prev-half) and 60 OPeNDAP
-requests that each transfer ~25× more data than needed.
-
-**Background:** Forecast files have dimensions
-`(forecast_initial_time, forecast_hour, latitude, longitude)`.  Init times
-are every 6 hours (00, 06, 12, 18 UTC) with 12 forecast hours each.  Only
-the last 1–2 init times of the prev-half file produce hours that fall in the
-target month (e.g. Dec 31 18:00 → forecast hours 7–12 cover Jan 1 00:00–
-05:00).
-
-**Fix:** In the forecast branch of `_retrieve_var` (or the new
-`_retrieve_fc_half` from F5), subset `forecast_initial_time` on the prev-half
-dataset before loading.  Only the init times whose forecast hours can reach
-into the target month need to be kept:
-
-```python
-def _subset_fc_for_month(ds, year, month, is_prev_half):
-    """Subset forecast_initial_time to only inits relevant to (year, month).
-
-    For the prev-half file, keep only the last 2 init times (the ones whose
-    forecast hours spill into the target month).  For the target month's own
-    halves, keep everything (all inits produce target-month hours).
-    """
-    if not is_prev_half:
-        return ds
-    # Last 2 inits (12:00 and 18:00 of last day) is conservative;
-    # only the 18:00 init is strictly needed for the 00–05 spill,
-    # but keeping 2 is cheap insurance.
-    init_times = ds["forecast_initial_time"].values
-    return ds.isel(forecast_initial_time=slice(-2, None))
-```
-
-Call this between `_sel_bbox` and `_fc_to_hourly`:
-
-```python
-for i, url in enumerate(urls):
-    with _open_opendap(url) as ds:
-        subset = _sel_bbox(ds, x0, y0, x1, y1)
-        subset = _subset_fc_for_month(subset, year, month, is_prev_half=(i == 0))
-        parts.append(_fc_to_hourly(subset, ncar_var))
-```
-
-The `.isel()` is applied before `.load()` inside `_fc_to_hourly`, so OPeNDAP
-only transfers the selected init times — server-side subsetting.
-
-**Impact:** Reduces prev-half downloads from ~65 MB to ~2–4 MB each.  Total
-bandwidth savings: ~3.8 GB for a full-year European cutout.  Also reduces
-memory pressure (relevant to F7).
-
-### Implementation order
-
-```
-F1 (context managers) + F2 (remove sorts)   — small, independent, do first
-F3 (time tolerance)                          — small, independent
-F4 (retry + workers)                         — small, independent
-F8 (subset prev-half)                        — small, independent, big bandwidth win
-F5 (parallelize fc halves)                   — medium, refactors _retrieve_var
-F6 (batch interp)                            — small, after F5 stabilizes
-F7 (lazy/dask loading)                       — large, do last
-```
-
-F1–F4 and F8 can be done in any order (or in parallel).  F8 is a small,
-localised change with the largest bandwidth impact — it should be prioritised
-alongside F1.  F5 restructures `_retrieve_var`, so F1/F2/F8 should land first
-to avoid merge conflicts.  F6 is a small change to `_fetch_vars` that's
-independent of F5 but benefits from a stable API.  F7 is a larger
-architectural change that should come after everything else is solid.
