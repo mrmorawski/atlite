@@ -466,7 +466,9 @@ def _bbox(coords):
     )
 
 
-def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar", show_progress=False):
+def _fetch_vars(
+    short_names, coords, tmpdir=None, desc="era5-ncar", show_progress=False
+):
     """Fetch variables with parallel downloads, return lazy dask DataArrays.
 
     Architecture:
@@ -480,10 +482,6 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar", s
       3. **Return** — lazy dask-backed DataArrays on the cutout's
          (time, y, x) grid (or (y, x) for invariant height).
 
-    The ``lock`` parameter (typically a ``dask.utils.SerializableLock``)
-    is passed to ``xr.open_dataset`` to serialise HDF5/netCDF4 chunk reads,
-    which are not thread-safe.
-
     If ``tmpdir`` is None, a TemporaryDirectory is created internally and the
     returned DataArrays are eagerly loaded before it is deleted.
 
@@ -492,7 +490,13 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar", s
     """
     if tmpdir is None:
         with tempfile.TemporaryDirectory() as _tmpdir:
-            assembled = _fetch_vars(short_names, coords, tmpdir=_tmpdir, lock=lock, desc=desc, show_progress=show_progress)
+            assembled = _fetch_vars(
+                short_names,
+                coords,
+                tmpdir=_tmpdir,
+                desc=desc,
+                show_progress=show_progress,
+            )
             return {sn: da.load() for sn, da in assembled.items()}
 
     x0, y0, x1, y1 = _bbox(coords)
@@ -512,7 +516,7 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar", s
     all_futures = {}  # Future → label (for progress logging)
 
     for sn in short_names:
-        product_dir, param_code, ncar_var = VAR_MAP[sn]
+        product_dir, param_code, _ = VAR_MAP[sn]
 
         if product_dir == "e5.oper.invariant":
             f = _pool.submit(_retrieve_var, sn, x0, y0, x1, y1, tmpdir)
@@ -583,19 +587,12 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar", s
     # ------------------------------------------------------------------
     # Phase 2: Assemble lazy dask graph per variable.
     #
-    # Each raw temp file is opened lazily via xr.open_dataset with the
-    # caller's lock (serialises HDF5 chunk reads, which are not
-    # thread-safe).  Time selection, unit conversion, coordinate
+    # Each raw temp file is opened lazily via xr.open_dataset.
+    # Time selection, unit conversion, coordinate
     # renaming, and spatial interpolation are all deferred as lazy
     # dask operations — nothing is materialised here.
     # ------------------------------------------------------------------
     assembled = {}
-    # Note: we do NOT pass a custom lock here.  xarray uses NETCDF4_PYTHON_LOCK
-    # by default, which is the same global lock that Phase 1's to_netcdf() calls
-    # use.  Passing a session-specific lock would create a mismatch: Phase 1
-    # writes (using NETCDF4_PYTHON_LOCK) and Phase 2 reads (using our lock) would
-    # not synchronise, causing HDF5 crashes when a fast feature's Phase 2 overlaps
-    # with a slow feature's Phase 1 in concurrent dask delayed tasks.
     open_kw = dict(chunks={"time": 720})
 
     for sn in short_names:
@@ -625,9 +622,7 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar", s
             # fc.sfc.accumu
             month_parts = []
             for year, month in months:
-                paths = [
-                    fc_futures[url].result() for url in fc_urls[(sn, year, month)]
-                ]
+                paths = [fc_futures[url].result() for url in fc_urls[(sn, year, month)]]
                 halves = []
                 for p in paths:
                     halves.append(xr.open_dataset(p, **open_kw)["data"])
@@ -669,8 +664,14 @@ def _fetch_vars(short_names, coords, tmpdir=None, lock=None, desc="era5-ncar", s
 # ---------------------------------------------------------------------------
 
 
-def get_data_wind(coords, tmpdir=None, lock=None, show_progress=False):
-    v = _fetch_vars(_FEATURE_VARS["wind"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar wind", show_progress=show_progress)
+def get_data_wind(coords, tmpdir=None, show_progress=False):
+    v = _fetch_vars(
+        _FEATURE_VARS["wind"],
+        coords,
+        tmpdir=tmpdir,
+        desc="era5-ncar wind",
+        show_progress=show_progress,
+    )
     wnd10m = np.sqrt(v["u10"] ** 2 + v["v10"] ** 2)
     wnd100m = np.sqrt(v["u100"] ** 2 + v["v100"] ** 2)
     wnd_shear_exp = (np.log(wnd10m / wnd100m) / np.log(10.0 / 100.0)).assign_attrs(
@@ -689,8 +690,14 @@ def get_data_wind(coords, tmpdir=None, lock=None, show_progress=False):
     )
 
 
-def get_data_influx(coords, tmpdir=None, lock=None, show_progress=False):
-    v = _fetch_vars(_FEATURE_VARS["influx"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar influx", show_progress=show_progress)
+def get_data_influx(coords, tmpdir=None, show_progress=False):
+    v = _fetch_vars(
+        _FEATURE_VARS["influx"],
+        coords,
+        tmpdir=tmpdir,
+        desc="era5-ncar influx",
+        show_progress=show_progress,
+    )
     ssrd, ssr, fdir, tisr = v["ssrd"], v["ssr"], v["fdir"], v["tisr"]
     albedo = ((ssrd - ssr) / ssrd.where(ssrd != 0)).fillna(0.0)
     influx_diffuse = ssrd - fdir
@@ -712,8 +719,14 @@ def get_data_influx(coords, tmpdir=None, lock=None, show_progress=False):
     return xr.merge([ds, sp])
 
 
-def get_data_temperature(coords, tmpdir=None, lock=None, show_progress=False):
-    v = _fetch_vars(_FEATURE_VARS["temperature"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar temperature", show_progress=show_progress)
+def get_data_temperature(coords, tmpdir=None, show_progress=False):
+    v = _fetch_vars(
+        _FEATURE_VARS["temperature"],
+        coords,
+        tmpdir=tmpdir,
+        desc="era5-ncar temperature",
+        show_progress=show_progress,
+    )
     return xr.Dataset(
         {
             "temperature": v["t2m"].rename("temperature"),
@@ -723,13 +736,25 @@ def get_data_temperature(coords, tmpdir=None, lock=None, show_progress=False):
     )
 
 
-def get_data_runoff(coords, tmpdir=None, lock=None, show_progress=False):
-    v = _fetch_vars(_FEATURE_VARS["runoff"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar runoff", show_progress=show_progress)
+def get_data_runoff(coords, tmpdir=None, show_progress=False):
+    v = _fetch_vars(
+        _FEATURE_VARS["runoff"],
+        coords,
+        tmpdir=tmpdir,
+        desc="era5-ncar runoff",
+        show_progress=show_progress,
+    )
     return xr.Dataset({"runoff": v["ro"].rename("runoff")})
 
 
-def get_data_height(coords, tmpdir=None, lock=None, show_progress=False):
-    v = _fetch_vars(_FEATURE_VARS["height"], coords, tmpdir=tmpdir, lock=lock, desc="era5-ncar height", show_progress=show_progress)
+def get_data_height(coords, tmpdir=None, show_progress=False):
+    v = _fetch_vars(
+        _FEATURE_VARS["height"],
+        coords,
+        tmpdir=tmpdir,
+        desc="era5-ncar height",
+        show_progress=show_progress,
+    )
     return xr.Dataset({"height": v["z"].rename("height")})
 
 
@@ -738,7 +763,7 @@ def get_data_height(coords, tmpdir=None, lock=None, show_progress=False):
 # ---------------------------------------------------------------------------
 
 
-def get_data(cutout, feature, tmpdir=None, lock=None, **creation_parameters):
+def get_data(cutout, feature, tmpdir=None, **creation_parameters):
     """Retrieve ERA5 data from NCAR THREDDS/OPeNDAP.
 
     Same interface as ``atlite.datasets.era5.get_data()``.
@@ -760,13 +785,13 @@ def get_data(cutout, feature, tmpdir=None, lock=None, **creation_parameters):
 
     if tmpdir is not None:
         # Normal workflow: atlite's prepare machinery manages tmpdir lifecycle.
-        ds = func(coords, tmpdir=tmpdir, lock=lock, show_progress=show_progress)
+        ds = func(coords, tmpdir=tmpdir, show_progress=show_progress)
     else:
         # Direct call with no tmpdir: use a TemporaryDirectory so temp files
         # are cleaned up automatically.  Data must be loaded eagerly since the
         # temp files are deleted when the context exits.
         with tempfile.TemporaryDirectory() as _tmpdir:
-            ds = func(coords, tmpdir=_tmpdir, lock=lock, show_progress=show_progress).load()
+            ds = func(coords, tmpdir=_tmpdir, show_progress=show_progress).load()
 
     if sanitize and sanitize_func is not None:
         ds = sanitize_func(ds)
