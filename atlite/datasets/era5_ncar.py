@@ -442,10 +442,16 @@ def _retrieve_var_inner(
 
     # Write to a temp file first, then atomically rename to cache path.
     # This avoids leaving a partial file if the process is interrupted.
+    # Serialise with _nc4_open_lock: HDF5's C library is not thread-safe for
+    # concurrent H5Fcreate/H5Dwrite calls, even to distinct files.  Multiple
+    # ThreadPoolExecutor workers writing simultaneously corrupt HDF5 global
+    # state (same class of problem as concurrent H5Fopen in Phase 2).
+    # Downloads (.load() via pydap) are I/O-bound and unaffected by this lock.
     fd, tmp_path = tempfile.mkstemp(suffix=".nc.tmp", dir=tmpdir)
     os.close(fd)
     try:
-        da.to_dataset(name="data").to_netcdf(tmp_path)
+        with _nc4_open_lock:
+            da.to_dataset(name="data").to_netcdf(tmp_path)
         os.rename(tmp_path, path)
     except BaseException:
         # Clean up partial file on failure
