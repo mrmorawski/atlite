@@ -22,4 +22,7 @@ cutout = atlite.Cutout(
 )
 cutout.prepare()
 ```
+
+Caveats:
+- the data has some delay vs. ERA5, ERA5T, so it is not a best choice for very recent data
 """

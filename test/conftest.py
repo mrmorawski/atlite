@@ -138,6 +138,52 @@ def cutout_era5t(cutouts_path):
     )
 
 
+def _prepare_era5_ncar_cutout(path, **kwargs):
+    cutout = Cutout(path=path, module="era5-ncar", bounds=BOUNDS, **kwargs)
+    cutout.prepare()
+    return cutout
+
+
+@pytest.fixture(scope="session")
+def cutout_era5_ncar(cutouts_path):
+    tmp_path = cutouts_path / "cutout_era5_ncar.nc"
+    return _prepare_era5_ncar_cutout(tmp_path, time=TIME)
+
+
+@pytest.fixture(scope="session")
+def cutout_era5_ncar_coarse(cutouts_path):
+    tmp_path = cutouts_path / "cutout_era5_ncar_coarse.nc"
+    return _prepare_era5_ncar_cutout(tmp_path, time=TIME, dx=0.5, dy=0.7)
+
+
+@pytest.fixture(scope="session")
+def cutout_era5_ncar_weird_resolution(cutouts_path):
+    tmp_path = cutouts_path / "cutout_era5_ncar_weird_resolution.nc"
+    return _prepare_era5_ncar_cutout(tmp_path, time=TIME, dx=0.132, dy=0.32)
+
+
+@pytest.fixture(scope="session")
+def cutout_era5_ncar_2days_crossing_months(cutouts_path):
+    tmp_path = cutouts_path / "cutout_era5_ncar_2days_crossing_months.nc"
+    return _prepare_era5_ncar_cutout(tmp_path, time=slice("2013-02-28", "2013-03-01"))
+
+
+@pytest.fixture(scope="session")
+def cutout_era5_ncar_3h_sampling(cutouts_path):
+    tmp_path = cutouts_path / "cutout_era5_ncar_3h_sampling.nc"
+    time = [
+        f"{TIME} 00:00",
+        f"{TIME} 03:00",
+        f"{TIME} 06:00",
+        f"{TIME} 09:00",
+        f"{TIME} 12:00",
+        f"{TIME} 15:00",
+        f"{TIME} 18:00",
+        f"{TIME} 21:00",
+    ]
+    return _prepare_era5_ncar_cutout(tmp_path, time=time)
+
+
 @pytest.fixture(scope="session")
 def cutout_sarah(cutouts_path):
     tmp_path = cutouts_path / "cut_out_sarah.nc"

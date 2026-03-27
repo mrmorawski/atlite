@@ -21,6 +21,7 @@ import urllib3
 from dateutil.relativedelta import relativedelta
 from shapely.geometry import LineString as Line
 from shapely.geometry import Point
+from xarray.testing import assert_allclose
 
 import atlite
 from atlite import Cutout
@@ -585,6 +586,137 @@ class TestERA5:
     @staticmethod
     def test_line_rating_era5(cutout_era5):
         return line_rating_test(cutout_era5)
+
+
+class TestERA5NCAR:
+    """
+    Conversion tests against ERA5-NCAR data.
+
+    Mirrors TestERA5 so that any regression in the NCAR module is caught by
+    the same test helpers.  Also verifies that the NCAR output is numerically
+    close to the CDS reference cutout.
+    """
+
+    @staticmethod
+    def test_data_module_arguments(cutout_era5_ncar):
+        """
+        All data variables should have an attribute to which module they
+        belong.
+        """
+        for _ in cutout_era5_ncar.data:
+            assert cutout_era5_ncar.data.attrs["module"] == "era5-ncar"
+
+    @staticmethod
+    def test_all_non_na(cutout_era5_ncar):
+        assert np.isfinite(cutout_era5_ncar.data).all()
+
+    @staticmethod
+    def test_all_non_na_coarse(cutout_era5_ncar_coarse):
+        assert np.isfinite(cutout_era5_ncar_coarse.data).all()
+
+    @staticmethod
+    def test_all_non_na_weird_resolution(cutout_era5_ncar_weird_resolution):
+        assert np.isfinite(cutout_era5_ncar_weird_resolution.data).all()
+
+    @staticmethod
+    def test_dx_dy_preservation(cutout_era5_ncar):
+        assert np.allclose(np.diff(cutout_era5_ncar.data.x), 0.25)
+        assert np.allclose(np.diff(cutout_era5_ncar.data.y), 0.25)
+
+    @staticmethod
+    def test_dx_dy_preservation_coarse(cutout_era5_ncar_coarse):
+        assert np.allclose(
+            np.diff(cutout_era5_ncar_coarse.data.x),
+            cutout_era5_ncar_coarse.data.attrs["dx"],
+        )
+        assert np.allclose(
+            np.diff(cutout_era5_ncar_coarse.data.y),
+            cutout_era5_ncar_coarse.data.attrs["dy"],
+        )
+
+    @staticmethod
+    def test_dx_dy_preservation_weird_resolution(cutout_era5_ncar_weird_resolution):
+        assert np.allclose(
+            np.diff(cutout_era5_ncar_weird_resolution.data.x),
+            cutout_era5_ncar_weird_resolution.data.attrs["dx"],
+        )
+        assert np.allclose(
+            np.diff(cutout_era5_ncar_weird_resolution.data.y),
+            cutout_era5_ncar_weird_resolution.data.attrs["dy"],
+        )
+
+    @staticmethod
+    def test_prepared_features(cutout_era5_ncar):
+        return prepared_features_test(cutout_era5_ncar)
+
+    @staticmethod
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="NetCDF update not working on windows"
+    )
+    @staticmethod
+    def test_wrong_loading(cutout_era5_ncar):
+        wrong_recreation(cutout_era5_ncar)
+
+    @staticmethod
+    def test_pv(cutout_era5_ncar):
+        return pv_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_pv_tracking(cutout_era5_ncar):
+        return pv_tracking_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_pv_era5_2days_crossing_months(cutout_era5_ncar_2days_crossing_months):
+        return pv_test(cutout_era5_ncar_2days_crossing_months, time="2013-03-01")
+
+    @staticmethod
+    def test_pv_era5_3h_sampling(cutout_era5_ncar_3h_sampling):
+        assert pd.infer_freq(cutout_era5_ncar_3h_sampling.data.time) == "3h"
+        return pv_test(cutout_era5_ncar_3h_sampling)
+
+    @staticmethod
+    def test_wind(cutout_era5_ncar):
+        return wind_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_runoff(cutout_era5_ncar):
+        return runoff_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_hydro(cutout_era5_ncar):
+        return hydro_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_solar_thermal(cutout_era5_ncar):
+        return solar_thermal_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_heat_demand(cutout_era5_ncar):
+        return heat_demand_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_soil_temperature(cutout_era5_ncar):
+        return soil_temperature_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_dewpoint_temperature(cutout_era5_ncar):
+        return dewpoint_temperature_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_line_rating(cutout_era5_ncar):
+        return line_rating_test(cutout_era5_ncar)
+
+    @staticmethod
+    def test_compare_with_era5(cutout_era5, cutout_era5_ncar):
+        """NCAR module output must match CDS reference within float32 tolerance."""
+
+        for var in cutout_era5.data.data_vars:
+            assert_allclose(
+                cutout_era5.data[var],
+                cutout_era5_ncar.data[var],
+                rtol=1e-4,
+                atol=1e-4,
+            )
 
 
 @pytest.mark.skipif(
