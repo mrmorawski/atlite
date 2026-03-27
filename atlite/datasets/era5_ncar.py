@@ -75,6 +75,16 @@ MAX_WORKERS = 8  # concurrent OPeNDAP requests
 # features that dask runs in parallel.  Threads are created on demand.
 _pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
+# Serialises concurrent xr.open_dataset() calls in Phase 2 of _fetch_vars.
+# dask runs one delayed get_data() per feature in separate threads; from cache
+# all five reach Phase 2 simultaneously, causing concurrent netCDF4.Dataset()
+# (i.e. H5Fopen) calls.  HDF5 without --enable-threadsafe has shared global
+# state (file ID table, malloc heap) that crashes under concurrent opens even
+# for different files.  Note: cannot use xarray's HDF5_LOCK here because
+# xr.open_dataset() itself calls _getitem which acquires HDF5_LOCK internally,
+# so wrapping with HDF5_LOCK would deadlock (it is not reentrant).
+_nc4_open_lock = threading.Lock()
+
 # Thread-local requests.Session for HTTP keep-alive reuse.
 _thread_local = threading.local()
 
@@ -476,10 +486,7 @@ def _fetch_vars(
          thread pool in parallel (I/O bound, full concurrency).  Each task
          writes a raw temp file at native resolution, cached by deterministic
          filename so interrupted runs are resumable.
-      2. **Assemble** — for each variable, open raw temp files lazily with
-         dask, concat months, select target times, and interpolate/sel to
-         the target grid.  All operations stay lazy.
-      3. **Return** — lazy dask-backed DataArrays on the cutout's
+      2. **Return** — lazy dask-backed DataArrays on the cutout's
          (time, y, x) grid (or (y, x) for invariant height).
 
     If ``tmpdir`` is None, a TemporaryDirectory is created internally and the
@@ -600,13 +607,15 @@ def _fetch_vars(
 
         if product_dir == "e5.oper.invariant":
             path = inv_futures[sn].result()
-            da = xr.open_dataset(path, chunks={})["data"]
+            with _nc4_open_lock:
+                da = xr.open_dataset(path, chunks={})["data"]
 
         elif product_dir == "e5.oper.an.sfc":
             parts = []
             for year, month in months:
                 path = an_futures[(sn, year, month)].result()
-                chunk = xr.open_dataset(path, **open_kw)["data"]
+                with _nc4_open_lock:
+                    chunk = xr.open_dataset(path, **open_kw)["data"]
                 mt = t[(t.year == year) & (t.month == month)]
                 if len(mt):
                     parts.append(
@@ -625,7 +634,8 @@ def _fetch_vars(
                 paths = [fc_futures[url].result() for url in fc_urls[(sn, year, month)]]
                 halves = []
                 for p in paths:
-                    halves.append(xr.open_dataset(p, **open_kw)["data"])
+                    with _nc4_open_lock:
+                        halves.append(xr.open_dataset(p, **open_kw)["data"])
                 hourly = xr.concat(halves, dim="time")
                 _, idx = np.unique(hourly.time.values, return_index=True)
                 hourly = hourly.isel(time=idx)

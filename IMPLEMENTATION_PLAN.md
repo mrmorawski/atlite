@@ -343,18 +343,25 @@ runs.  Raw OPeNDAP download cache files also live in `./tmp/`.
 3. **Lock is threaded correctly** ✅
    `get_features` (in `data.py`) creates a `SerializableLock` and passes it
    through `delayed(get_data)(..., lock=lock)` → `get_data()` → `_fetch_vars()`.
-   **Implementation detail:** `_fetch_vars` intentionally does *not* pass the
-   external lock to `xr.open_dataset`.  Instead it relies on xarray's built-in
-   `NETCDF4_PYTHON_LOCK`, which is the same lock used by the Phase 1
-   `to_netcdf()` writes.  Passing a different lock would create a mismatch
-   between concurrent Phase 1 writes and Phase 2 reads.  The net thread-safety
-   guarantee is identical.
+   The external lock is ignored by `era5_ncar`; thread safety is provided by
+   two mechanisms:
+   - **Phase 2 file opens** (`xr.open_dataset`): serialised by `_nc4_open_lock`,
+     a module-level `threading.Lock()`.  Required because dask's threaded
+     scheduler runs one `get_data` task per feature concurrently; from a warm
+     cache all features reach Phase 2 simultaneously, causing concurrent
+     `netCDF4.Dataset()` (i.e. `H5Fopen`) calls that corrupt HDF5's global
+     state.  `HDF5_LOCK` cannot be used as the outer wrapper because
+     `xr.open_dataset` internally acquires it for eager coordinate reads via
+     `NetCDF4ArrayWrapper._getitem`, which would deadlock.
+   - **Chunk reads** (during `to_netcdf().compute()`): serialised by xarray's
+     built-in `NETCDF4_PYTHON_LOCK = CombinedLock([HDF5_LOCK, NETCDFC_LOCK])`.
 
 4. **No HDF5 crashes under concurrency** ✅
-   Tested with 5 consecutive runs — zero segfaults or "double free" errors:
-   ```bash
-   for i in $(seq 5); do uv run pytest test/test_preparation_and_conversion.py::TestERA5NCAR -q --cache-path ./tmp || break; done
-   ```
+   Verified: `scripts/profile_germany.py` runs correctly from a warm cache
+   (222 cached files, all 5 features, full 2013 year, 338 MB output, ~15 s).
+   The original crash was `RuntimeError: NetCDF: HDF error / corrupted size vs.
+   prev_size while consolidating` — a glibc heap corruption from concurrent
+   `H5Fopen` calls — fixed by `_nc4_open_lock`.
 
 5. **No-tmpdir fallback works** ✅ *(bug fixed during testing)*
    The original code crashed with `TypeError: expected str … not NoneType`
@@ -392,13 +399,14 @@ Processing (excl. download) must complete in <45 min.  Verified: ~12.4 min.
 
 ```
 cutout.prepare()
-  └─ get_features()                    # data.py — creates SerializableLock
-       └─ get_data(lock=lock)          # era5_ncar.py
-            └─ get_data_wind(lock=lock)
-                 └─ _fetch_vars(lock=lock)
+  └─ get_features()                    # data.py — creates SerializableLock (ignored by era5_ncar)
+       └─ get_data()  ×5 features      # era5_ncar.py — run concurrently by dask threaded scheduler
+            └─ get_data_wind / _influx / …
+                 └─ _fetch_vars()
                       ├─ Phase 1: parallel OPeNDAP downloads → raw .nc files
-                      └─ Phase 2: open_dataset(lock=lock) → lazy dask graph
+                      └─ Phase 2: with _nc4_open_lock:   ← serialises H5Fopen across feature threads
+                              open_dataset(path, chunks={"time":720}) → lazy dask graph
   └─ ds.to_netcdf(compute=False)       # dask writes final cutout
-       └─ dask scheduler reads chunks through the lock (HDF5-safe)
+       └─ dask scheduler reads chunks via _getitem → NETCDF4_PYTHON_LOCK (HDF5-safe)
 ```
 

@@ -35,8 +35,16 @@ uv run pytest test/test_preparation_and_conversion.py::TestERA5NCAR -v --cache-p
 - `--cache-path ./tmp` reuses already-prepared cutout `.nc` files and raw
   download cache files across runs.  Without it, every run re-downloads from
   NCAR THREDDS (~15 min for a single day over Scotland).
-- `./tmp/` must exist.  It is pre-populated and committed to the repo as a
-  persistent cache.
+- `./tmp/` must exist and be populated before tests can run from cache.
+  It is **not committed to git** — `.nc` files are too large.  Populate it
+  by running the tests once against a live THREDDS connection:
+  ```bash
+  uv run pytest test/test_preparation_and_conversion.py::TestERA5NCAR -v --cache-path ./tmp
+  ```
+  This writes `./tmp/cutout_era5_ncar.nc` (the prepared cutout) and
+  `./tmp/era5_ncar_*.nc` (raw per-variable downloads).  All subsequent
+  runs with `--cache-path ./tmp` reuse these files and complete in ~2 s
+  with no network access.
 - Tests hit the live NCAR THREDDS server (no mocks).  They are skipped
   automatically if THREDDS is unreachable and no cached cutout exists.
 - All 16 tests pass in ~2 s from cache.
@@ -135,9 +143,16 @@ cutout.prepare(features=[...], tmpdir="./tmp")
 Key invariants:
 - Phase 1 completes fully (all downloads) before Phase 2 starts.
 - Phase 2 returns **lazy** arrays; no materialisation until `to_netcdf`.
-- `xr.open_dataset` uses xarray's built-in `NETCDF4_PYTHON_LOCK` (not the
-  external `SerializableLock`) to serialise HDF5 chunk reads.  This is
-  intentional — see the comment at `era5_ncar.py:618`.
+- Phase 2 `xr.open_dataset` calls are serialised by `_nc4_open_lock` (a
+  module-level `threading.Lock` in `era5_ncar.py`).  This is required because
+  dask runs one `get_data` thread per feature concurrently; from cache all
+  features reach Phase 2 simultaneously, causing concurrent `H5Fopen` calls
+  that corrupt HDF5's global state.  `NETCDF4_PYTHON_LOCK` only protects chunk
+  reads (via `_getitem`), not the initial file open in `NetCDF4DataStore.__init__`.
+  `HDF5_LOCK` cannot be used as the outer wrapper because `xr.open_dataset`
+  internally acquires it for coordinate reads, which would deadlock.
+- Chunk reads during `to_netcdf` are serialised by xarray's built-in
+  `NETCDF4_PYTHON_LOCK = CombinedLock([HDF5_LOCK, NETCDFC_LOCK])`.
 - Raw download files are cached by deterministic filename in `tmpdir`; re-runs
   with the same `tmpdir` skip already-downloaded files.
 
@@ -181,7 +196,8 @@ chunking, so each month ends up as 1–2 chunks.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `HTTP 403` from THREDDS | `.roll()` called on lazy pydap dataset → full global download → 500 MB limit | Never call `.roll()`; use two `.sel()` calls for cross-meridian bboxes |
-| HDF5 "double free" / segfault | Concurrent HDF5 reads without serialisation | Ensured by xarray's `NETCDF4_PYTHON_LOCK` — check it isn't being bypassed |
+| HDF5 heap corruption / `corrupted size vs. prev_size` on cache rebuild | Concurrent `H5Fopen` calls in Phase 2: dask runs one `get_data` thread per feature; from cache all reach Phase 2 simultaneously | Fixed by `_nc4_open_lock` in `era5_ncar.py` — serialises `xr.open_dataset` calls across threads |
+| HDF5 chunk-read crashes | Concurrent HDF5 reads without serialisation | Ensured by xarray's `NETCDF4_PYTHON_LOCK` — check it isn't being bypassed |
 | `test_compare_with_era5` skipped/fails | `./tmp/cutout_era5.nc` missing | Run `TestERA5` first, or use `--cache-path ./tmp` with a pre-populated cache |
 | Stale `.nc` assertion failures | Old files in `tmp/` for a different bbox | Delete bbox-specific files matching the variable + hash |
 
