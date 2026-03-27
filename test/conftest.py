@@ -23,8 +23,9 @@ CDS_API_CONFIGURED = bool(os.environ.get("CDSAPI_URL"))
 def _check_thredds():
     """Return True if the NCAR THREDDS server is reachable."""
     try:
-        r = requests.head(
-            "https://thredds.rda.ucar.edu/thredds/catalog.html", timeout=10
+        r = requests.get(
+            "https://thredds.rda.ucar.edu/thredds/catalog/files/g/d633000/catalog.html",
+            timeout=15,
         )
         return r.status_code < 500
     except Exception:
