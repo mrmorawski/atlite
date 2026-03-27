@@ -35,10 +35,14 @@ Technical notes
   with OPeNDAP support.
 """
 
+import atexit
 import calendar
+import datetime
 import hashlib
 import logging
 import os
+import pathlib
+import shutil
 import tempfile
 import threading
 import traceback
@@ -50,7 +54,7 @@ from tqdm import tqdm
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
 )
@@ -87,6 +91,20 @@ _nc4_open_lock = threading.Lock()
 
 # Thread-local requests.Session for HTTP keep-alive reuse.
 _thread_local = threading.local()
+
+# Auto-created download directories to clean up at process exit.
+# Only populated when the user did not provide a tmpdir (i.e. downloads went
+# to .cache/ rather than /tmp).  atexit runs after cutout_prepare has finished
+# writing its output, so the files are safe to delete.
+_auto_download_dirs: list = []
+
+
+def _cleanup_auto_download_dirs():
+    for d in _auto_download_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+atexit.register(_cleanup_auto_download_dirs)
 
 
 _REQUEST_TIMEOUT = (30, 300)  # (connect, read) seconds
@@ -353,6 +371,23 @@ def _cache_key(short_name, x0, y0, x1, y1, year=None, month=None, url=None):
         return f"era5_ncar_{short_name}_inv_{bbox_hash}.nc"
 
 
+def _is_retriable_download_error(exc):
+    """Retry predicate for _retrieve_var_inner.
+
+    Retry on network errors and low-level I/O errors, but NOT on
+    FileNotFoundError: that means tmpdir was deleted (another task failed and
+    maybe_remove_tmpdir cleaned up while _pool threads were still running).
+    Retrying is pointless — the directory is gone for the rest of the run.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return False
+    if isinstance(exc, OSError):
+        return True
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True
+    return False
+
+
 def _retrieve_var(short_name, x0, y0, x1, y1, tmpdir, year=None, month=None, url=None):
     """Fetch one ERA5 variable from NCAR OPeNDAP, write to a temp NetCDF file.
 
@@ -397,7 +432,7 @@ def _retrieve_var(short_name, x0, y0, x1, y1, tmpdir, year=None, month=None, url
 @retry(
     wait=wait_random_exponential(multiplier=1, min=2, max=120),
     stop=stop_after_attempt(8),
-    retry=retry_if_exception_type((requests.exceptions.RequestException, OSError)),
+    retry=retry_if_exception(_is_retriable_download_error),
     before_sleep=before_sleep_log(logger, logging.DEBUG),
 )
 def _retrieve_var_inner(
@@ -453,6 +488,18 @@ def _retrieve_var_inner(
         with _nc4_open_lock:
             da.to_dataset(name="data").to_netcdf(tmp_path)
         os.rename(tmp_path, path)
+    except RuntimeError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        if "HDF" in str(exc):
+            free_mb = shutil.disk_usage(tmpdir).free // (1024 * 1024)
+            raise RuntimeError(
+                f"{exc}  (disk free in tmpdir: {free_mb} MB — "
+                "if low, re-run with --tmpdir on a larger disk)"
+            ) from exc
+        raise
     except BaseException:
         # Clean up partial file on failure
         try:
@@ -779,6 +826,35 @@ def get_data_height(coords, tmpdir=None, show_progress=False):
 # ---------------------------------------------------------------------------
 
 
+def _download_dir(tmpdir):
+    """Return the directory to use for raw ERA5-NCAR downloads.
+
+    ``tmpdir`` comes from ``data.cutout_prepare`` via ``data.get_features``.
+    When the caller did not provide a ``tmpdir``, ``data.maybe_remove_tmpdir``
+    silently creates one under ``tempfile.gettempdir()`` (usually a tmpfs-backed
+    ``/tmp``).  At Europe scale that fills the tmpfs and causes HDF write errors.
+
+    Strategy:
+    - If ``tmpdir`` was explicitly set by the user (i.e. it is outside the
+      system temp directory), use it as-is.
+    - Otherwise create ``.cache/era5_ncar_<timestamp>_<random>/`` in the
+      working directory.  This is on the regular filesystem, won't fill tmpfs,
+      and is not cleaned up automatically (delete when prepare is done).
+    """
+    system_tmp = str(pathlib.Path(tempfile.gettempdir()).resolve())
+    if tmpdir is not None:
+        resolved = str(pathlib.Path(tmpdir).resolve())
+        if not resolved.startswith(system_tmp):
+            return tmpdir  # user-provided path outside /tmp — use it
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    cache_root = pathlib.Path(".cache")
+    cache_root.mkdir(exist_ok=True)
+    download_dir = tempfile.mkdtemp(prefix=f"era5_ncar_{ts}_", dir=cache_root)
+    _auto_download_dirs.append(download_dir)
+    logger.info("era5-ncar: no user tmpdir; downloading to %s", download_dir)
+    return download_dir
+
+
 def get_data(cutout, feature, tmpdir=None, **creation_parameters):
     """Retrieve ERA5 data from NCAR THREDDS/OPeNDAP.
 
@@ -799,15 +875,7 @@ def get_data(cutout, feature, tmpdir=None, **creation_parameters):
 
     logger.info("era5-ncar: fetching feature '%s'...", feature)
 
-    if tmpdir is not None:
-        # Normal workflow: atlite's prepare machinery manages tmpdir lifecycle.
-        ds = func(coords, tmpdir=tmpdir, show_progress=show_progress)
-    else:
-        # Direct call with no tmpdir: use a TemporaryDirectory so temp files
-        # are cleaned up automatically.  Data must be loaded eagerly since the
-        # temp files are deleted when the context exits.
-        with tempfile.TemporaryDirectory() as _tmpdir:
-            ds = func(coords, tmpdir=_tmpdir, show_progress=show_progress).load()
+    ds = func(coords, tmpdir=_download_dir(tmpdir), show_progress=show_progress)
 
     if sanitize and sanitize_func is not None:
         ds = sanitize_func(ds)
