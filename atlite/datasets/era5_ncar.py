@@ -64,8 +64,8 @@ from atlite.pv.solar_position import SolarPosition
 
 logger = logging.getLogger(__name__)
 
-# Suppress noisy transport-layer loggers — retries are already reported
-# through tenacity's before_sleep_log on the atlite.datasets.era5_ncar logger.
+# Suppress noisy transport-layer loggers — per-attempt retry events are logged
+# at DEBUG level; final failures are logged at ERROR by the download loop.
 logging.getLogger("pydap").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 
@@ -398,7 +398,7 @@ def _retrieve_var(short_name, x0, y0, x1, y1, tmpdir, year=None, month=None, url
     wait=wait_random_exponential(multiplier=1, min=2, max=120),
     stop=stop_after_attempt(8),
     retry=retry_if_exception_type((requests.exceptions.RequestException, OSError)),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
+    before_sleep=before_sleep_log(logger, logging.DEBUG),
 )
 def _retrieve_var_inner(
     short_name,
